@@ -1,0 +1,31 @@
+name = "agems-rag-api"
+main = "src/index.py"
+compatibility_date = "2024-01-01"
+
+# Indica que este é um Python Worker
+[build]
+command = "python -m pip install -r requirements.txt"
+
+# Binding do R2 Storage
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "agems-docs"
+
+# Binding do D1 Database
+[[d1_databases]]
+binding = "DB"
+database_name = "agems-rag-db"
+database_id = "3545442e-116f-472a-8d02-18b9551c158b"  # ID do banco real: D1 Database/agems-rag-db/3545442e-116f-472a-8d02-18b9551c158b
+
+# Binding do Vectorize
+[[vectorize]]
+binding = "VECTORIZE_INDEX"
+index_name = "agems-regulatory-docs"
+
+# Binding do Workers AI
+[ai]
+binding = "AI"
+
+# Variáveis de ambiente (secrets serão adicionados via wrangler secret)
+[vars]
+ENVIRONMENT = "development"
