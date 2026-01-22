@@ -1,3 +1,10 @@
+import sys
+import os
+
+# Adiciona a pasta vendor ao path de busca do Python
+vendor_path = os.path.join(os.path.dirname(__file__), 'vendor')
+sys.path.insert(0, vendor_path)
+
 from js import Response
 import json
 
@@ -5,6 +12,7 @@ import json
 from handlers.upload import handle_upload
 from handlers.process import handle_process
 from handlers.query import handle_query
+
 
 async def on_fetch(request, env):
     """
