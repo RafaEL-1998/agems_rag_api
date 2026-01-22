@@ -5,7 +5,7 @@ async def process_and_vectorize_chunks(env, document_id, doc, chunks):
         
         # Gerar embedding usando Workers AI
         embedding_response = await env.AI.run(
-            env.MODEL_EMBEDDING,
+            '@cf/qwen/qwen3-embedding-0.6b',
             {"text": chunk}
         )
         
@@ -17,7 +17,7 @@ async def process_and_vectorize_chunks(env, document_id, doc, chunks):
         text_preview = chunk[:200] if len(chunk) > 200 else chunk
 
         # Inserir no Vectorize
-        await env.VECTORIZE_INDEX.insert([{
+       await env.VECTORIZE_INDEX.insert([{
             "id": vector_id,
             "values": embedding,
             "metadata": {

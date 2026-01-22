@@ -31,7 +31,7 @@ async def handle_upload(request, env):
   file_size = len(file_content)
 
   # Salvar no R2
-  await env.BUCKET.put(r2_key, file_content)
+  await env.R2_BUCKET.put(r2_key, file_content)
 
   # Registrar metadados no D1
   await env.DB.prepare("""
