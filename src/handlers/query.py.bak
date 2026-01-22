@@ -17,6 +17,37 @@ async def handle_query(request, env):
             status=400
         )
 
+    # Se o session_id não for fornecido, recuperar o histórico
+    history = []
+    if session_id:
+        history_result = await env.DB.prepare("""
+        SELECT message_type, content 
+        FROM conversations
+        WHERE session_id = ?
+        ORDER BY timestamp DESC
+        LIMIT 10
+        """).bind(session_id).all()
+
+        history = list(reversed(history_result["results"]))
+    else:
+        # Criar nova sessão
+        session_id = str(uuid.uuid4())
+        await env.DB.prepare("""
+        INSERT INTO sessions (session_id, created_at, last_activity) 
+        VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """).bind(session_id).run()
+
+    # Modificar construção de mensagens para incluir histórico
+    messages = [
+        {"role": "system", "content": system_prompt}]
+
+    # Adicionar histórico ao messages
+    for msg in history:
+        messages.append({
+            "role": msg["message_type"], 
+            "content": msg["content"]
+        })
+    
     # Gerar Embedding da pergunta do usuário
     query_embedding_response = await env.AI.run(
         '@cf/qwen/qwen3-embedding-0.6b',

@@ -5,7 +5,7 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "agems-rag-api",
-	"main": "src/entry.py",
+	"main": "src/index.py",
 	"compatibility_date": "2025-09-27",
 	"compatibility_flags": [
 		"python_workers"
