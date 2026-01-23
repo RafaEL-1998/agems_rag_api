@@ -5,12 +5,13 @@ import os
 vendor_path = os.path.join(os.path.dirname(__file__), 'vendor')
 sys.path.insert(0, vendor_path)
 
-from js import Response
+from js import Response, Object, Headers
+from pyodide.ffi import to_js
 import json
 
 # Importar handlers
 from handlers.upload import handle_upload
-from handlers.process import handle_process
+from handlers.chunks import handle_add_chunks
 from handlers.query import handle_query
 
 
@@ -27,21 +28,31 @@ async def on_fetch(request, env):
     if "/documents/upload" in url and method == "POST":
         return await handle_upload(request, env)
     
-    elif "/documents/" in url and "/process" in url and method == "POST":
-        return await handle_process(request, env)
+    elif "/documents/" in url and "/chunks" in url and method == "POST":
+        return await handle_add_chunks(request, env)
     
     elif "/chat/query" in url and method == "POST":
         return await handle_query(request, env)
     
-    elif method == "GET" and url.endswith("/"):
-        return Response.json({
-            "service": "AGEMS IA Regulatória",
-            "version": "1.0.0",
-            "status": "online"
-        })
+    elif method == "GET":
+        return Response.new(
+            json.dumps({
+                "service": "AGEMS IA Regulatória",
+                "url": url,
+                "status": "online"
+            }),
+            to_js({"headers": {"Content-Type": "application/json"}})
+        )
     
     else:
-        return Response.json(
-            {"error": "Endpoint not found"},
-            status=404
-        )
+        from js import JSON
+        init = JSON.parse(json.dumps({
+            "status": 404,
+            "headers": {"Content-Type": "application/json"}
+        }))
+        return Response.new(json.dumps({"error": "Endpoint not found"}), init)
+
+
+
+
+

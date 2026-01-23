@@ -1,33 +1,46 @@
-async def process_and_vectorize_chunks(env, document_id, doc, chunks):
-    """ Gera embeddings e armazena no Vectorize """
+from pyodide.ffi import to_js
 
-    for i, chunk in enumerate(chunks):
-        
-        # Gerar embedding usando Workers AI
-        embedding_response = await env.AI.run(
-            '@cf/qwen/qwen3-embedding-0.6b',
-            {"text": chunk}
-        )
-        
-        # Extrair vetor embedding
-        embedding = embedding_response['data'][0]
+async def process_and_vectorize_chunks(env, document_id, doc_metadata, chunks):
+    """
+    Recebe chunks com embeddings JÁ GERADOS e apenas insere no Vectorize.
+    
+    Args:
+        env: Cloudflare Worker environment
+        document_id: ID do documento
+        doc_metadata: Metadados do documento (title, type, sector)
+        chunks: Lista de dicts com estrutura:
+            {
+                "id": "chunk-0",
+                "embedding": [0.1, 0.2, ...],  # Vetor de 768 dims
+                "text": "conteúdo do chunk",
+                "metadata": {...}  # Opcional
+            }
+    
+    Returns:
+        Número de chunks processados
+    """
+    vectors = []
 
-        # Preparar metadados
-        vector_id = f"{document_id}-chunk-{i}"
-        text_preview = chunk[:200] if len(chunk) > 200 else chunk
-
-        # Inserir no Vectorize
-        await env.VECTORIZE.insert([{
-            "id": vector_id,
-            "values": embedding,
+    for chunk in chunks:
+        vector_obj = {
+            "id": f"{document_id}-{chunk['id']}",
+            "values": chunk["embedding"],  # JÁ VEM PRONTO DO CLIENTE
             "metadata": {
                 "document_id": document_id,
-                "chunk_index": i,
-                "title": doc['title'],
-                "type": doc['type'],
-                "sector": doc['sector'],
-                "text_preview": text_preview
+                "title": doc_metadata.get("title", "Unknown"),
+                "type": doc_metadata.get("type", "Document"),
+                "sector": doc_metadata.get("sector", "General"),
+                "text": chunk.get("text", ""),
+                "chunk_index": chunk.get("chunk_index", 0),
+                **chunk.get("metadata", {})  # Metadados adicionais opcionais
             }
-        }])
+        }
+        vectors.append(vector_obj)
 
-    return len(chunks)
+    # Inserir todos os vetores de uma vez (mais eficiente)
+    if vectors:
+        print(f"DEBUG: Inserindo {len(vectors)} vetores no Vectorize...")
+        await env.VECTORIZE.insert(to_js(vectors))
+        print(f"DEBUG: {len(vectors)} vetores inseridos com sucesso!")
+
+    return len(vectors)

@@ -1,0 +1,85 @@
+from js import Response, FormData, Uint8Array
+from pyodide.ffi import to_js
+import json
+import uuid
+
+async def handle_upload(request, env):
+    """
+    Handler de Upload - Versao com to_js explicito conforme sugestao do usuario.
+    """
+    try:
+        print(f"DEBUG: Recebendo request de upload")
+        form_data = await request.formData()
+        
+        file = form_data.get("file")
+        title = form_data.get("title") or "Sem Titulo"
+        doc_type = form_data.get("type") or "Documento"
+        sector = form_data.get("sector") or "Geral"
+
+        if not file:
+            return Response.new(
+                json.dumps({"error": "No file uploaded"}),
+                headers={"Content-Type": "application/json"},
+                status=400
+            )
+
+        doc_id = str(uuid.uuid4())
+        r2_key = f"documents/{doc_id}.pdf"
+
+        # 1. R2 - Upload usando Uint8Array (mais seguro para binarios)
+        print(f"DEBUG: Salvando no R2")
+        array_buffer = await file.arrayBuffer()
+        await env.agems_docs.put(r2_key, Uint8Array.new(array_buffer))
+
+        # 2. D1 - O SEGREDO: Converter para JS e usar o metodo correto
+        print(f"DEBUG: Registrando no D1 com to_js")
+        
+        sql = """
+            INSERT INTO documents (id, title, type, sector, r2_key, status)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """
+        
+        params = [
+            str(doc_id),
+            str(title),
+            str(doc_type),
+            str(sector),
+            str(r2_key),
+            "pending"
+        ]
+
+        try:
+            # Prepara o statement
+            statement = env.agems_rag_db.prepare(sql)
+            
+            # Converte explicitamente para uma 'Sequence' do JavaScript (Array JS)
+            js_params = to_js(params, dict_converter=None)
+            
+            # Chamamos o bind e o run
+            await statement.bind(js_params).run()
+            print("DEBUG: Sucesso no D1!")
+            
+        except Exception as d1_err:
+            print(f"ERRO NO D1 (to_js): {str(d1_err)}")
+            # Fallback opcional se o usuário permitir, mas por enquanto vamos seguir a risca
+            raise d1_err
+
+        return Response.new(
+            json.dumps({
+                "success": True, 
+                "document_id": doc_id,
+                "message": "Upload e registro concluidos com sucesso (to_js)"
+            }),
+            headers={"Content-Type": "application/json"},
+            status=201
+        )
+
+    except Exception as e:
+        import traceback
+        err_trace = traceback.format_exc()
+        print(f"FALHA NO UPLOAD: {err_trace}")
+        return Response.new(
+            json.dumps({"error": str(e), "trace": err_trace}),
+            headers={"Content-Type": "application/json"},
+            status=500
+        )
