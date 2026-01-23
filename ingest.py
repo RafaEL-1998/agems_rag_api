@@ -5,7 +5,7 @@ import os
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 import requests
-import PyPDF2
+import pypdf
 import json
 from utils.chunking import chunk_text
 
@@ -14,9 +14,9 @@ WORKER_BASE_URL = "https://agems-rag-api.dgeagems.workers.dev"
 FOLDER_PATH = "./documentos_para_processar"
 
 def extract_text_locally(filepath):
-    """ Extrai o texto do PDF localmente usando PyPDF2 """
+    """ Extrai o texto do PDF localmente usando pypdf """
     with open(filepath, 'rb') as f:
-        reader = PyPDF2.PdfReader(f)
+        reader = pypdf.PdfReader(f)
         text_parts = []
         for page in reader.pages:
             t = page.extract_text()
@@ -120,7 +120,7 @@ def generate_embeddings_fallback(chunks):
     
     for i, chunk_text in enumerate(chunks):
         random.seed(hash(chunk_text))
-        embedding = [random.random() for _ in range(768)]
+        embedding = [random.random() for _ in range(1024)]
         
         chunks_with_embeddings.append({
             "id": f"chunk-{i}",

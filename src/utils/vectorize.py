@@ -1,46 +1,65 @@
+import math
 from pyodide.ffi import to_js
+from js import Object
+
+def sanitize_embedding(embedding):
+    """
+    Garante que o embedding seja uma lista de floats válidos.
+    Remove NaNs e Infinitos.
+    """
+    try:
+        clean = []
+        for x in embedding:
+            xf = float(x)
+            if math.isnan(xf) or math.isinf(xf):
+                return None
+            clean.append(xf)
+        return clean
+    except:
+        return None
 
 async def process_and_vectorize_chunks(env, document_id, doc_metadata, chunks):
     """
-    Recebe chunks com embeddings JÁ GERADOS e apenas insere no Vectorize.
-    
-    Args:
-        env: Cloudflare Worker environment
-        document_id: ID do documento
-        doc_metadata: Metadados do documento (title, type, sector)
-        chunks: Lista de dicts com estrutura:
-            {
-                "id": "chunk-0",
-                "embedding": [0.1, 0.2, ...],  # Vetor de 768 dims
-                "text": "conteúdo do chunk",
-                "metadata": {...}  # Opcional
-            }
-    
-    Returns:
-        Número de chunks processados
+    Recebe chunks com embeddings JÁ GERADOS e insere no Vectorize.
+    Aplica sanitização rigorosa para evitar erros de formato.
     """
     vectors = []
 
     for chunk in chunks:
+        # 1. Sanitização do Embedding
+        emb = sanitize_embedding(chunk["embedding"])
+        if emb is None:
+            print(f"WARN: Chunk {chunk.get('id')} descartado por embedding inválido/NaN")
+            continue
+
+        # 2. Construção do Objeto Vetor
         vector_obj = {
             "id": f"{document_id}-{chunk['id']}",
-            "values": chunk["embedding"],  # JÁ VEM PRONTO DO CLIENTE
+            "values": emb,
             "metadata": {
-                "document_id": document_id,
-                "title": doc_metadata.get("title", "Unknown"),
-                "type": doc_metadata.get("type", "Document"),
-                "sector": doc_metadata.get("sector", "General"),
-                "text": chunk.get("text", ""),
+                "document_id": str(document_id),
+                "title": str(doc_metadata.get("title", "Unknown")),
+                "type": str(doc_metadata.get("type", "Document")),
+                "sector": str(doc_metadata.get("sector", "General")),
+                "text": str(chunk.get("text", "")),
                 "chunk_index": chunk.get("chunk_index", 0),
-                **chunk.get("metadata", {})  # Metadados adicionais opcionais
+                # Incorporar metadados extras removendo Nones
+                **{k: v for k, v in chunk.get("metadata", {}).items() if v is not None}
             }
         }
         vectors.append(vector_obj)
 
-    # Inserir todos os vetores de uma vez (mais eficiente)
-    if vectors:
-        print(f"DEBUG: Inserindo {len(vectors)} vetores no Vectorize...")
-        await env.VECTORIZE.insert(to_js(vectors))
-        print(f"DEBUG: {len(vectors)} vetores inseridos com sucesso!")
+    if not vectors:
+        print("WARN: Nenhum vetor válido para inserir neste lote.")
+        return 0
 
+    # 3. DEBUG CRÍTICO (Amostragem)
+    # print(f"DEBUG VECTOR SAMPLE: ID={vectors[0]['id']} DIMS={len(vectors[0]['values'])}")
+
+    # 4. Inserção no Vectorize
+    # Usamos dict_converter=Object.fromEntries para garantir que dicts Python virem Objetos JS (e não Maps)
+    # O método é .insert() (que atua como upsert no Cloudflare Vectorize)
+    await env.VECTORIZE.insert(to_js(vectors, dict_converter=Object.fromEntries))
+    
+    print(f"DEBUG: {len(vectors)} vetores inseridos com sucesso!")
     return len(vectors)
