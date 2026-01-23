@@ -1,98 +1,64 @@
 from js import Response
 from pyodide.ffi import to_js
 import json
+from js import Object
 
 async def handle_query(request, env):
-    """
-    Handler de Query RAG: 
-    1. Gera embedding da pergunta
-    2. Busca chunks relevantes no Vectorize
-    3. Gera resposta contextualizada usando Llama 3.1
-    """
-    
     try:
-        body = await request.json()
-        user_query = body.get("query")
+        body_proxy = await request.json()
+        body = body_proxy.to_py()
+        user_query = str(body.get("query", "Olá"))
         
-        if not user_query:
-            return Response.new(
-                json.dumps({"error": "Query is required"}),
-                to_js({
-                    "headers": {"Content-Type": "application/json"},
-                    "status": 400
-                })
-            )
+        # Teste direto com Llama para validar Bindings
+        try:
+            test_llm = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', to_js({
+                "prompt": "Responda apenas 'OK'",
+                "max_tokens": 5
+            }))
+            print("DEBUG: Llama Test OK")
+        except Exception as e:
+            return Response.new(json.dumps({"error": f"Erro Binding AI: {str(e)}"}), to_js({"status": 500}))
 
-        # 1. Gerar embedding da pergunta do usuário
-        embedding_response_proxy = await env.AI.run(
-            '@cf/qwen/qwen3-embedding-0.6b',
-            {"text": user_query}
-        )
-        embedding_response = embedding_response_proxy.to_py()
-        query_vector = embedding_response['data'][0]
+        # Tentativa 1: BGE-M3 com string direta
+        # Tentativa 2: BGE-M3 com dict e Object.fromEntries
+        try:
+            print(f"DEBUG: Tentando BGE-M3 com string direta")
+            res_proxy = await env.AI.run('@cf/baai/bge-m3', user_query)
+            res = res_proxy.to_py()
+            query_vector = res['data'][0]
+        except Exception as e1:
+            print(f"DEBUG: Falha string direta: {str(e1)}")
+            try:
+                print(f"DEBUG: Tentando BGE-M3 com dict e Object.fromEntries")
+                # Forçando a conversão para Object JS puro
+                res_proxy = await env.AI.run('@cf/baai/bge-m3', to_js({"text": user_query}, dict_converter=Object.fromEntries))
+                res = res_proxy.to_py()
+                query_vector = res['data'][0]
+            except Exception as e2:
+                return Response.new(json.dumps({
+                    "error": "Falha total no embedding",
+                    "e1_string": str(e1),
+                    "e2_dict": str(e2)
+                }), to_js({"status": 500}))
 
-        # 2. Buscar os Top 5 chunks mais relevantes no Vectorize
-        vector_search = await env.VECTORIZE.query(
-            vector=query_vector,
-            top_k=5,
-            return_metadata=True
-        )
+        # Se chegou aqui, temos o vetor. Vamos buscar no Vectorize.
+        try:
+            vector_search_proxy = await env.VECTORIZE.query(vector=query_vector, top_k=3, return_metadata=True)
+            vector_search = vector_search_proxy.to_py()
+            matches = vector_search.get('matches', [])
+            context = "\n".join([m.get('metadata', {}).get('text', '') for m in matches])
+        except Exception as e:
+            return Response.new(json.dumps({"error": f"Erro Vectorize: {str(e)}"}), to_js({"status": 500}))
 
-        # 3. Extrair e formatar o contexto dos metadados
-        context_chunks = []
-        sources = []
-        
-        for match in vector_search.matches:
-            metadata = match.metadata.to_py()
-            text_content = metadata.get("text", "")
-            doc_title = metadata.get("title", "Documento desconhecido")
-            context_chunks.append(f"--- DOCUMENTO: {doc_title} ---\n{text_content}")
-
-            
-            if doc_title not in sources:
-                sources.append(doc_title)
-
-        context_text = "\n\n".join(context_chunks)
-
-        # 4. Construir o Prompt para o Llama 3.1
-        system_prompt = """Você é a IA Regulatória da AGEMS (Agência de Regulação de Serviços Públicos de Mato Grosso do Sul).
-Sua missão é responder perguntas baseando-se EXCLUSIVAMENTE nos documentos fornecidos como contexto.
-Se a informação não estiver no contexto, diga honestamente que não possui essa informação específica nos documentos regulatórios atuais.
-Mantenha um tom profissional, técnico e prestativo."""
-
-        full_prompt = f"""CONTEXTO REGULATÓRIO:
-{context_text}
-
-PERGUNTA DO USUÁRIO:
-{user_query}
-
-RESPOSTA:"""
-
-        # 5. Gerar a resposta final
-        llm_response = await env.AI.run(
-            '@cf/meta/llama-3.1-8b-instruct-fast',
-            {
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": full_prompt}
-                ]
-            }
-        )
+        # Resposta Final
+        prompt = f"Contexto: {context}\n\nPergunta: {user_query}\n\nResposta:"
+        llm_res = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', to_js({"prompt": prompt}))
+        answer = llm_res.to_py().get("response", "...")
 
         return Response.new(
-            json.dumps({
-                "answer": llm_response.get("response", "Erro ao gerar resposta"),
-                "sources": sources,
-                "context_used": len(context_chunks)
-            }),
+            json.dumps({"answer": answer, "debug_vector_len": len(query_vector)}),
             to_js({"headers": {"Content-Type": "application/json"}})
         )
 
     except Exception as e:
-        return Response.new(
-            json.dumps({"error": f"Query failed: {str(e)}"}),
-            to_js({
-                "headers": {"Content-Type": "application/json"},
-                "status": 500
-            })
-        )
+        return Response.new(json.dumps({"error": str(e)}), to_js({"status": 500}))
