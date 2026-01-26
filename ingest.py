@@ -31,7 +31,7 @@ def extract_text_locally(filepath):
 def generate_embeddings_locally(chunks):
     """
     Gera embeddings localmente usando a API da Cloudflare Workers AI.
-    Retorna uma lista de chunks com embeddings incluídos.
+    Retorna uma lista de chunks com embeddings e metadados incluídos.
     """
     import os
     from dotenv import load_dotenv
@@ -45,8 +45,6 @@ def generate_embeddings_locally(chunks):
     
     if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
         print("      ERRO: Credenciais da Cloudflare não encontradas!")
-        print("      Crie um arquivo .env com CLOUDFLARE_ACCOUNT_ID e CLOUDFLARE_API_TOKEN")
-        print("      Usando vetores aleatórios como fallback...")
         return generate_embeddings_fallback(chunks)
     
     url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/baai/bge-m3"
@@ -59,10 +57,14 @@ def generate_embeddings_locally(chunks):
     chunks_with_embeddings = []
     errors = 0
     
-    for i, chunk_text in enumerate(chunks):
+    for i, chunk_data in enumerate(chunks):
+        # Agora o chunk é um dict: {"text": "...", "metadata": {...}}
+        text_content = chunk_data.get("text", "")
+        extra_metadata = chunk_data.get("metadata", {})
+
         try:
             # Sanitizar o texto antes de enviar
-            clean_text = chunk_text.replace('\x00', '').strip()
+            clean_text = text_content.replace('\x00', '').strip()
             if len(clean_text) < 10:
                 print(f"         WARN: Chunk {i} muito curto, pulando...")
                 continue
@@ -82,7 +84,8 @@ def generate_embeddings_locally(chunks):
                     "id": f"chunk-{i}",
                     "embedding": embedding,
                     "text": clean_text,
-                    "chunk_index": i
+                    "chunk_index": i,
+                    "metadata": extra_metadata # Preserva metadados hierárquicos
                 })
                 
                 if (i + 1) % 50 == 0:
@@ -94,43 +97,37 @@ def generate_embeddings_locally(chunks):
                     print("         Muitos erros, abortando...")
                     break
             
-            # Rate limiting: 300 req/min = ~5 req/s, então esperamos 0.2s entre chamadas
             time.sleep(0.25)
             
         except Exception as e:
             print(f"         ERRO chunk {i}: {str(e)}")
             errors += 1
-            if errors > 10:
-                break
-    
-    print(f"      -> {len(chunks_with_embeddings)} embeddings gerados com sucesso!")
-    if errors > 0:
-        print(f"      -> {errors} erros encontrados")
+            if errors > 10: break
     
     return chunks_with_embeddings
 
 def generate_embeddings_fallback(chunks):
     """
-    Fallback: Gera vetores aleatórios para teste quando as credenciais não estão disponíveis.
+    Fallback: Gera vetores aleatórios para teste.
     """
     import random
-    
     print("      -> Gerando embeddings com vetores aleatórios (MODO TESTE)...")
     chunks_with_embeddings = []
     
-    for i, chunk_text in enumerate(chunks):
-        random.seed(hash(chunk_text))
+    for i, chunk_data in enumerate(chunks):
+        text_content = chunk_data.get("text", "")
+        extra_metadata = chunk_data.get("metadata", {})
+
+        random.seed(hash(text_content))
         embedding = [random.random() for _ in range(1024)]
         
         chunks_with_embeddings.append({
             "id": f"chunk-{i}",
             "embedding": embedding,
-            "text": chunk_text,
-            "chunk_index": i
+            "text": text_content,
+            "chunk_index": i,
+            "metadata": extra_metadata
         })
-        
-        if (i + 1) % 100 == 0:
-            print(f"         -> {i + 1}/{len(chunks)} embeddings gerados...")
     
     return chunks_with_embeddings
 

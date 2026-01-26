@@ -27,7 +27,7 @@ def analyze_local_doc(filepath):
     print(f"\nTotal de Chunks Gerados: {len(chunks)}")
     
     # 3. Auditoria Detalhada
-    lengths = [len(c) for c in chunks]
+    lengths = [len(c["text"]) for c in chunks]
     
     with open("testes_validacao/local_chunk_report.txt", "w", encoding="utf-8") as f:
         f.write("RELATÓRIO DE AUDITORIA LOCAL - CHUNKING ADAPTATIVO\n")
@@ -37,7 +37,10 @@ def analyze_local_doc(filepath):
         broken_count = 0
         multi_article_count = 0
         
-        for i, chunk in enumerate(chunks):
+        for i, chunk_data in enumerate(chunks):
+            chunk = chunk_data["text"]
+            meta = chunk_data["metadata"]
+            
             # Procura por padrões de Artigos
             articles = re.findall(r'(?:Art\.|Artigo)\s?\d+', chunk)
             
@@ -51,6 +54,7 @@ def analyze_local_doc(filepath):
                 multi_article_count += 1
                 
             f.write(f"--- CHUNK {i} ({len(chunk)} chars) ---\n")
+            f.write(f"Hierarquia: {meta}\n")
             f.write(f"Artigos detectados ({len(articles)}): {', '.join(articles)}\n")
             if is_broken:
                 f.write("!!! Alerta: Provável quebra no meio de frase/artigo !!!\n")

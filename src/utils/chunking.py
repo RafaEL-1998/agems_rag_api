@@ -25,15 +25,31 @@ def identify_document_type(text):
 
 def clean_pdf_text(text):
     """
-    Remove ruídos de PDF e normaliza espaços.
+    Remove ruídos de PDF, normaliza espaços e exclui lixo editorial.
     """
-    # Remove rodapés comuns (ex: Page X of Y)
+    # 1. Lixo Editorial e Metadados do DOU
+    trash_patterns = [
+        r'Este texto não substitui o publicado no Diário Oficial.*',
+        r'Publicado no DOU de \d{2}/\d{2}/\d{2}.*',
+        r'Republicado por ter saído com erro.*',
+        r'Diário Oficial da União\s?-\s?Seção\s?\d+.*',
+        r'Brasília, \d{1,2} de [a-z]+ de \d{4}.*',
+        r'\(.*\*\).*', # Notas de rodapé ou asteriscos solitários
+    ]
+    for p in trash_patterns:
+        text = re.sub(p, '', text, flags=re.IGNORECASE | re.MULTILINE)
+
+    # 2. Remoção de assinaturas comuns (nomes em caixa alta no final de blocos)
+    # Tenta identificar nomes precedidos de cargos em linhas isoladas
+    text = re.sub(r'\n\s*[A-ZÁÉÍÓÚ ]{10,}\s*\n\s*(?:Diretor|Presidente|Secretário)', '\n', text)
+
+    # 3. Limpeza técnica do PDF
     text = re.sub(r'\d{2}/\d{2}/\d{2},?\s\d{2}:\d{2}\s+Page\s+\d+\s+of\s+\d+', '', text)
-    # Remove números de página isolados
     text = re.sub(r'^\s*\d+\s*$', '', text, flags=re.MULTILINE)
     text = re.sub(r'\r\n', '\n', text)
     text = re.sub(r'[ \t]+', ' ', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
+    
     return text.strip()
 
 def intelligent_split(text, size, overlap):
@@ -113,22 +129,29 @@ def intelligent_split(text, size, overlap):
         if len(chunks) > 0 and start >= text_len: break
             
     return [c for c in chunks if c]
+
 def chunk_text(text, chunk_size=None, chunk_overlap=None):
     """
-    Versão Hierárquica 0-Broken: Meta ~1200 chars, 0 quebras bruscas.
-    Identifica e injeta Título, Capítulo e Seção em cada chunk.
+    Versão Produção AGEMS:
+    - Retorna Lista de Dicionários {text, metadata}
+    - Hierarquia Completa: Título > Capítulo > Seção > Artigo > Parágrafo
+    - Regra: Unidade mínima Artigo (Parágrafo vira sub-chunk)
+    - 0 Quebras bruscas
     """
     text = clean_pdf_text(text)
     doc_type = identify_document_type(text)
 
-    if doc_type != "legal":
-        limit = chunk_size or 1000
-        overlap = chunk_overlap or 200
-        return intelligent_split(text, limit, overlap)
+    # Limite de produção para RAG de alta fidelidade
+    limit = chunk_size or 1200
+    overlap = chunk_overlap or 250
 
-    # --- LÓGICA JURÍDICA HIERÁRQUICA ---
-    # Regex agressivo para capturar keywords mesmo coladas em outros textos (ex: 'RESOLVE:TÍTULO I')
-    pattern = r'(T.TULO\s*[IVXLCDM\d]+|CAP.TULO\s*[IVXLCDM\d]+|SE..O\s*[IVXLCDM\d]+|SUBSE..O\s*[IVXLCDM\d]+|Art\.\s?\d+|Artigo\s?\d+|§\s?\d+|Parágrafo\s?único)'
+    if doc_type != "legal":
+        simple_chunks = intelligent_split(text, limit, overlap)
+        return [{"text": c, "metadata": {}} for c in simple_chunks]
+
+    # --- LÓGICA JURÍDICA AGEMS ---
+    # Separadores: Títulos, Capítulos, Seções, Subseções, Artigos, §, Parágrafo único, Incisos
+    pattern = r'(\b(?:TÍTULO|CAPÍTULO|SEÇÃO|SUBSEÇÃO|Art\.|Artigo)\s*[IVXLC\d]+|§\s?\d+|Parágrafo\s?único|[IVXLCDM]+\s?-)'
     raw_parts = re.split(pattern, text, flags=re.IGNORECASE)
     
     units = []
@@ -136,109 +159,115 @@ def chunk_text(text, chunk_size=None, chunk_overlap=None):
         units.append(raw_parts[0].strip())
     
     for i in range(1, len(raw_parts), 2):
-        delimiter = raw_parts[i]
-        content = raw_parts[i+1] if i+1 < len(raw_parts) else ""
-        units.append((delimiter + content).strip())
+        units.append((raw_parts[i] + (raw_parts[i+1] if i+1 < len(raw_parts) else "")).strip())
 
     chunks = []
     current_chunk = ""
     
-    # Estado da Hierarquia
+    # Estado da Hierarquia Detalhada
     hierarchy = {
-        "TÍTULO": "",
-        "CAPÍTULO": "",
-        "SEÇÃO": "",
-        "SUBSEÇÃO": "",
-        "ARTIGO": ""
+        "titulo": None,
+        "capitulo": None,
+        "secao": None,
+        "subsecao": None,
+        "artigo": None,
+        "paragrafo": None
     }
 
     def get_breadcrumb():
         parts = []
-        for level in ["TÍTULO", "CAPÍTULO", "SEÇÃO", "SUBSEÇÃO", "ARTIGO"]:
-            if hierarchy[level]:
-                parts.append(hierarchy[level])
-        if not parts: return ""
-        return "[" + " > ".join(parts) + "] "
+        if hierarchy["titulo"]: parts.append(hierarchy["titulo"])
+        if hierarchy["capitulo"]: parts.append(hierarchy["capitulo"])
+        if hierarchy["secao"]: parts.append(hierarchy["secao"])
+        if hierarchy["subsecao"]: parts.append(hierarchy["subsecao"])
+        if hierarchy["artigo"]: parts.append(hierarchy["artigo"])
+        if hierarchy["paragrafo"]: parts.append(hierarchy["paragrafo"])
+        return "[" + " > ".join(parts) + "] " if parts else ""
 
-    def finalize_chunk(content, current_hierarchy_str):
+    def finalize_chunk(content, meta_state):
         if not content: return
         content = content.strip()
         
-        # Injeção forçada de contexto se não estiver presente
-        if not content.startswith("[") and current_hierarchy_str:
-            content = current_hierarchy_str + content
+        breadcrumb = get_breadcrumb()
+        if not content.startswith("[") and breadcrumb:
+            content = breadcrumb + content
 
-        # Regra de Ouro: No Broken Chunks
+        # Garantia Anti-Quebra Brusca
         if not content[-1] in ".;!":
             content += "."
-        chunks.append(content)
-
-    limit = chunk_size or 1200
-    overlap = chunk_overlap or 300
+            
+        chunks.append({
+            "text": content,
+            "metadata": {k: v for k, v in meta_state.items() if v}
+        })
 
     for unit in units:
-        # 1. Update Hierarchy tracking (Busca as keywords no início da unit)
-        found_header = False
-        sample = unit[:100] # Amostra maior para segurança contra PDF colado
-        
-        mapping = {
-            "T.TULO": "TÍTULO",
-            "CAP.TULO": "CAPÍTULO",
-            "SE..O": "SEÇÃO",
-            "SUBSE..O": "SUBSEÇÃO"
-        }
+        found_struct = False
+        # Removemos o prefixo de breadcrumb se já estiver lá por alguma razão (segurança)
+        unit_clean = re.sub(r'^\[.*?\]\s*', '', unit)
+        sample = unit_clean[:60]
 
-        for key, level in mapping.items():
-            # Busca o nível e o numeral. Limitamos a IVXLC para evitar 'D' de 'DAS'
-            match = re.search(rf'({key}\s*([IVXLC\d]+))', sample, re.I)
-            if match and sample.lower().find(match.group(1).lower()) < 15:
-                hierarchy[level] = f"{level} {match.group(2)}".upper()
-                levels_order = ["TÍTULO", "CAPÍTULO", "SEÇÃO", "SUBSEÇÃO", "ARTIGO"]
-                start_clearing = False
+        # 1. Update Hierarchy
+        # Títulos, Capítulos, Seções: devem estar no INÍCIO do bloco
+        for level in ["TÍTULO", "CAPÍTULO", "SEÇÃO", "SUBSEÇÃO"]:
+            # O padrão deve ocorrer nos primeiros caracteres da unidade (ignorando espaços)
+            m = re.match(rf'\s*({level}\s*([IVXLC\d]+))', sample, re.I)
+            if m:
+                hierarchy[level.lower()] = f"{level} {m.group(2)}".upper()
+                # Limpa níveis inferiores
+                levels_order = ["titulo", "capitulo", "secao", "subsecao", "artigo", "paragrafo"]
+                start_c = False
                 for l in levels_order:
-                    if start_clearing: hierarchy[l] = ""
-                    if l == level: start_clearing = True
-                found_header = True
+                    if start_c: hierarchy[l] = None
+                    if l == level.lower(): start_c = True
+                found_struct = True
 
-        # Detecta Artigo
-        art_match = re.search(r'(?:Art\.|Artigo)\s?(\d+)', sample, re.I)
-        if art_match and sample.lower().find(art_match.group(0).lower()) < 20:
-            hierarchy["ARTIGO"] = f"Art. {art_match.group(1)}"
-            found_header = True
+        # Artigo: deve estar no INÍCIO do bloco (evita capturas de referências no meio do texto)
+        art_m = re.match(r'\s*(?:Art\.|Artigo)\s?(\d+[a-zA-Z\-]*)', sample, re.I)
+        if art_m:
+            hierarchy["artigo"] = f"Art. {art_m.group(1)}"
+            hierarchy["paragrafo"] = None
+            found_struct = True
 
-        # Se mudou de nível, fecha o chunk anterior
-        if found_header and current_chunk:
-            finalize_chunk(current_chunk, get_breadcrumb())
+        # Parágrafo: (§ ou Parágrafo único) no início
+        para_m = re.match(r'\s*(§\s?\d+|Parágrafo\s?único)', sample, re.I)
+        if para_m:
+            hierarchy["paragrafo"] = para_m.group(1)
+            found_struct = True
+
+        # Se mudou estrutura relevante (Artigo ou superior), fecha anterior
+        # Parágrafos também podem fechar se quisermos granularidade total
+        if found_struct and current_chunk:
+            finalize_chunk(current_chunk, hierarchy)
             current_chunk = ""
 
-        # 2. Processamento da Unidade
-        breadcrumb = get_breadcrumb()
-        
-        if len(unit) + len(breadcrumb) > limit:
+        # 2. Processamento
+        ctx = get_breadcrumb()
+        if len(unit) + len(ctx) > limit:
             if current_chunk:
-                finalize_chunk(current_chunk, breadcrumb)
+                finalize_chunk(current_chunk, hierarchy)
                 current_chunk = ""
             
-            sub_parts = intelligent_split(unit, limit - len(breadcrumb) - 30, overlap)
+            sub_parts = intelligent_split(unit, limit - len(ctx) - 30, overlap)
             for sp in sub_parts:
-                final_sp = f"{breadcrumb}(cont.): {sp}"
-                finalize_chunk(final_sp, "") 
+                final_sp = f"{ctx}(cont.): {sp}"
+                finalize_chunk(final_sp, hierarchy)
             continue
 
-        # Acumulação protegida
         if current_chunk and (len(current_chunk) + len(unit) > limit):
-            finalize_chunk(current_chunk, breadcrumb)
-            current_chunk = f"{breadcrumb}(cont.): {unit}"
+            finalize_chunk(current_chunk, hierarchy)
+            current_chunk = f"{ctx}(cont.): {unit}"
         else:
             if not current_chunk:
-                current_chunk = breadcrumb + unit
+                current_chunk = ctx + unit
             else:
                 current_chunk += "\n" + unit
 
     if current_chunk:
-        finalize_chunk(current_chunk, get_breadcrumb())
+        finalize_chunk(current_chunk, hierarchy)
 
-    return [c for c in chunks if c]
+    return chunks
+
 
 
 
