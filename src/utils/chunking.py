@@ -84,22 +84,65 @@ def recursive_internal_split(text, chunk_size, chunk_overlap, separators=None):
         
     return [c for c in final_chunks if c]
 
-def chunk_text(text, chunk_size=1500, chunk_overlap=300):
+def calculate_adaptive_chunk_size(text, default_size=1500):
     """
-    Função principal híbrida: Detecta o tipo de documento e aplica 
-    a melhor estratégia de quebra.
+    Analisa a estrutura do documento para sugerir um tamanho de chunk ideal.
+    Para documentos jurídicos, tenta encontrar o tamanho médio dos artigos.
     """
+    doc_type = identify_document_type(text)
+    if doc_type != "legal":
+        return default_size
+
+    # Encontrar posições de "Art."
+    matches = list(re.finditer(r'\n\s*(?:Art\.|Artigo)\s?\d+', text))
+    if len(matches) < 2:
+        return default_size
+
+    # Calcular distâncias entre artigos
+    distances = []
+    for i in range(len(matches) - 1):
+        dist = matches[i+1].start() - matches[i].start()
+        if dist > 50: # Evita erros de captura muito próximos
+            distances.append(dist)
+
+    if not distances:
+        return default_size
+
+    # Usar a média das distâncias para definir o chunk_size
+    import statistics
+    avg_dist = statistics.mean(distances)
+    
+    # O chunk ideal deve ser um pouco maior que a média para garantir que 
+    # a maioria dos artigos caiba inteira, mas não tão grande que agrupe demais.
+    # Fator de 1.2x a 1.5x é o ideal para documentos legais.
+    adaptive_size = int(avg_dist * 1.3)
+    
+    # Limites de segurança para não criar chunks minúsculos ou gigantes
+    return max(600, min(adaptive_size, 3000))
+
+def chunk_text(text, chunk_size=None, chunk_overlap=None):
+    """
+    Função principal adaptativa: Detecta o tipo de documento, 
+    calcula o tamanho ideal e aplica a melhor estratégia de quebra.
+    """
+    # 1. Ajuste Adaptativo de Parâmetros
+    if chunk_size is None:
+        chunk_size = calculate_adaptive_chunk_size(text)
+    
+    if chunk_overlap is None:
+        chunk_overlap = int(chunk_size * 0.2) # 20% de overlap é o padrão ouro
+
+    print(f"DEBUG CHUNKING: Usando Size={chunk_size} Overlap={chunk_overlap}")
+
     doc_type = identify_document_type(text)
     
     if doc_type == "legal":
         # Estratégia Jurídica: Quebra primária por Artigos
-        # re.split com parênteses mantém o delimitador (o número do Artigo)
         raw_parts = re.split(r'(\n\s*(?:Art\.|Artigo)\s?\d+)', text)
         
-        # Reconstruir os Artigos (junta o delimitador com o conteúdo seguinte)
         parts = []
         if raw_parts:
-            parts.append(raw_parts[0]) # Texto antes do primeiro artigo (preâmbulo)
+            parts.append(raw_parts[0]) 
             for i in range(1, len(raw_parts), 2):
                 delimiter = raw_parts[i]
                 content = raw_parts[i+1] if i+1 < len(raw_parts) else ""
@@ -112,26 +155,21 @@ def chunk_text(text, chunk_size=1500, chunk_overlap=300):
     current_chunk = ""
 
     for part in parts:
-        # Se um único Artigo/Parágrafo for maior que o chunk_size, precisamos sub-dividi-lo
         if len(part) > chunk_size:
             if current_chunk:
                 chunks.append(current_chunk.strip())
                 current_chunk = ""
             
-            # Aplica sub-divisão recursiva dentro deste bloco gigante
             sub_chunks = recursive_internal_split(part, chunk_size, chunk_overlap)
             chunks.extend(sub_chunks)
             
-        # Se couber no chunk atual, adiciona
         elif len(current_chunk) + len(part) <= chunk_size:
             current_chunk += part if doc_type == "legal" else part + "\n\n"
             
-        # Se não couber, fecha o atual e inicia novo com overlap
         else:
             if current_chunk:
                 chunks.append(current_chunk.strip())
             
-            # Pega o final do chunk anterior para manter o contexto
             overlap_start = max(0, len(current_chunk) - chunk_overlap)
             current_chunk = current_chunk[overlap_start:] + part
 
@@ -139,3 +177,4 @@ def chunk_text(text, chunk_size=1500, chunk_overlap=300):
         chunks.append(current_chunk.strip())
         
     return [c for c in chunks if c]
+

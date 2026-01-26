@@ -7,9 +7,25 @@ async def handle_query(request, env):
         body_proxy = await request.json()
         body = body_proxy.to_py()
         user_query = str(body.get("query", ""))
+        session_id = body.get("session_id")
         
         if not user_query:
             return Response.new(json.dumps({"error": "Query is required"}), to_js({"status": 400}))
+
+        # 0. Recuperar Histórico do D1 (se houver session_id)
+        history = []
+        if session_id:
+            # Buscar as últimas 10 mensagens para manter contexto curto e eficiente
+            history_proxy = await env.agems_rag_db.prepare(
+                "SELECT message_type, content FROM conversations WHERE session_id = ? ORDER BY timestamp DESC LIMIT 10"
+            ).bind(session_id).all()
+            
+            history_data = history_proxy.to_py().get("results", [])
+            # Inverter para ordem cronológica (D1 retornou as mais novas primeiro)
+            for msg in reversed(history_data):
+                role = "assistant" if msg["message_type"] == "ai" else "user"
+                history.append({"role": role, "content": msg["content"]})
+
 
         # 1. Gerar embedding
         # bge-m3 espera {"text": ["..."]}
@@ -65,24 +81,52 @@ async def handle_query(request, env):
         # 4. Resposta com Llama 3.1
         system_prompt = (
             "Você é um assistente técnico especializado da AGEMS. "
-            "Sua resposta deve ser estritamente baseada no CONTEXTO fornecido. "
-            "Se o CONTEXTO disser que não encontrou informação, diga isso ao usuário. "
+            "Sua resposta deve ser estritamente baseada no CONTEXTO REUPERADO fornecido. "
+            "Se o CONTEXTO não contiver a resposta, informe o usuário. "
+            "Considere o histórico da conversa se for relevante para a pergunta atual."
             "Responda sempre em Português do Brasil."
         )
-        user_msg = f"CONTEXTO REUPERADO:\n{context_text}\n\nPERGUNTA DO USUÁRIO: {user_query}"
+        
+        # Montar lista de mensagens final
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # Adicionar histórico (sem o prompt de contexto para não poluir o histórico antigo)
+        messages.extend(history)
+        
+        # Adicionar a pergunta atual com o contexto RAG novo
+        current_augmented_msg = f"CONTEXTO REUPERADO:\n{context_text}\n\nPERGUNTA ATUAL: {user_query}"
+        messages.append({"role": "user", "content": current_augmented_msg})
         
         llm_input = to_js({
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg}
-            ]
+            "messages": messages
         }, dict_converter=Object.fromEntries)
 
         llm_res_proxy = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', llm_input)
         llm_res = llm_res_proxy.to_py()
         
-        # O Llama no Workers AI retorna {"response": "..."} ou {"result": {"response": "..."}}
         answer = llm_res.get("response") or llm_res.get("result", {}).get("response") or "Não foi possível gerar uma resposta."
+
+        # 5. Persistir no D1 (se houver session_id)
+        if session_id:
+            try:
+                # Salvar mensagem do usuário (salvamos a original, sem o contexto injetado)
+                await env.agems_rag_db.prepare(
+                    "INSERT INTO conversations (session_id, message_type, content) VALUES (?, 'user', ?)"
+                ).bind(session_id, user_query).run()
+                
+                # Salvar resposta da IA
+                await env.agems_rag_db.prepare(
+                    "INSERT INTO conversations (session_id, message_type, content, context_chunks, model_used) VALUES (?, 'ai', ?, ?, ?)"
+                ).bind(session_id, answer, json.dumps(sources), "llama-3.1-8b").run()
+                
+                # Atualizar ou Criar sessão
+                await env.agems_rag_db.prepare(
+                    "INSERT INTO sessions (id, last_activity, message_count) VALUES (?, CURRENT_TIMESTAMP, 1) "
+                    "ON CONFLICT(id) DO UPDATE SET last_activity = CURRENT_TIMESTAMP, message_count = message_count + 1"
+                ).bind(session_id).run()
+            except Exception as d1_err:
+                print(f"ERRO AO SALVAR NO D1: {str(d1_err)}")
+
 
         return Response.new(
             json.dumps({
