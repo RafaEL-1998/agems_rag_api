@@ -12,25 +12,39 @@ async def handle_query(request, env):
             return Response.new(json.dumps({"error": "Query is required"}), to_js({"status": 400}))
 
         # 1. Gerar embedding
-        # Usamos Object.fromEntries para garantir que o input seja um Objeto JS puro
+        # bge-m3 espera {"text": ["..."]}
         ai_input = to_js({"text": [user_query]}, dict_converter=Object.fromEntries)
         ai_res_proxy = await env.AI.run('@cf/baai/bge-m3', ai_input)
+        ai_res = ai_res_proxy.to_py()
         
+        # Se o Workers AI retornar um erro formatado como sucesso
+        if "error" in ai_res:
+             return Response.new(
+                json.dumps({"error": "Erro na API de AI", "details": ai_res["error"]}), 
+                to_js({"status": 500, "headers": {"Content-Type": "application/json"}})
+            )
+        
+        # O formato pode variar entre {"result": {"data": [...]}} e {"data": [...] }
+        if "result" in ai_res:
+            query_vector = ai_res["result"].get("data", [[]])[0]
+        else:
+            query_vector = ai_res.get("data", [[]])[0]
+        
+        if not query_vector:
+            return Response.new(
+                json.dumps({"error": "Vetor de embedding vazio", "raw": ai_res}), 
+                to_js({"status": 500, "headers": {"Content-Type": "application/json"}})
+            )
+
         # 2. Busca no Vectorize
-        # Importante: Tentamos acessar a data[0] diretamente do proxy JS para evitar conversão falha
-        try:
-            # Pegamos o vetor do proxy e garantimos que o Vectorize o veja como um Array JS
-            query_vector_js = ai_res_proxy.data[0]
-            
-            # Chamada da query passando o vetor JS diretamente
-            vector_search_proxy = await env.VECTORIZE.query(query_vector_js, top_k=5, return_metadata=True)
-            vector_search = vector_search_proxy.to_py()
-        except Exception as vec_err:
-            # Fallback caso o acesso direto ao proxy falhe em algum edge case
-            res_py = ai_res_proxy.to_py()
-            vec_py = res_py['data'][0]
-            vector_search_proxy = await env.VECTORIZE.query(to_js(vec_py), top_k=5, return_metadata=True)
-            vector_search = vector_search_proxy.to_py()
+        options = to_js({
+            "topK": 5,
+            "returnMetadata": True
+        }, dict_converter=Object.fromEntries)
+        
+        vector_search_proxy = await env.VECTORIZE.query(to_js(query_vector), options)
+        vector_search = vector_search_proxy.to_py()
+        print(f"DEBUG VECTOR SEARCH: {len(vector_search.get('matches', []))} matches")
 
         # 3. Processar Contexto
         matches = vector_search.get('matches', [])
@@ -39,19 +53,23 @@ async def handle_query(request, env):
         
         for m in matches:
             meta = m.get('metadata', {})
-            txt = meta.get('text', '')
-            src = meta.get('title', 'Documento')
+            txt = meta.get('text') or meta.get('content') or ""
+            src = meta.get('title') or "Documento"
             if txt:
                 context_text += f"\n\nFONTE: {src}\n{txt}"
                 if src not in sources: sources.append(src)
 
         if not context_text:
-            context_text = "Nenhum contexto relevante encontrado."
+            context_text = "Nenhum contexto relevante encontrado nos documentos oficiais."
 
         # 4. Resposta com Llama 3.1
-        # Usando a estrutura de messages sugerida
-        system_prompt = "Você é o assistente técnico da AGEMS. Responda em português baseado no contexto."
-        user_msg = f"CONTEXTO:\n{context_text}\n\nPERGUNTA: {user_query}"
+        system_prompt = (
+            "Você é um assistente técnico especializado da AGEMS. "
+            "Sua resposta deve ser estritamente baseada no CONTEXTO fornecido. "
+            "Se o CONTEXTO disser que não encontrou informação, diga isso ao usuário. "
+            "Responda sempre em Português do Brasil."
+        )
+        user_msg = f"CONTEXTO REUPERADO:\n{context_text}\n\nPERGUNTA DO USUÁRIO: {user_query}"
         
         llm_input = to_js({
             "messages": [
@@ -61,16 +79,26 @@ async def handle_query(request, env):
         }, dict_converter=Object.fromEntries)
 
         llm_res_proxy = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', llm_input)
-        answer = llm_res_proxy.to_py().get("response", "Erro na resposta")
+        llm_res = llm_res_proxy.to_py()
+        
+        # O Llama no Workers AI retorna {"response": "..."} ou {"result": {"response": "..."}}
+        answer = llm_res.get("response") or llm_res.get("result", {}).get("response") or "Não foi possível gerar uma resposta."
 
         return Response.new(
             json.dumps({
                 "answer": answer,
                 "sources": sources,
-                "debug_context_len": len(context_text)
+                "debug_context_len": len(context_text),
+                "match_count": len(matches)
             }),
             to_js({"headers": {"Content-Type": "application/json"}})
         )
 
     except Exception as e:
-        return Response.new(json.dumps({"error": f"Erro Final: {str(e)}"}), to_js({"status": 500}))
+        import traceback
+        error_stack = traceback.format_exc()
+        print(f"ERRO CRITICO: {error_stack}")
+        return Response.new(
+            json.dumps({"error": str(e), "stack": error_stack}), 
+            to_js({"status": 500, "headers": {"Content-Type": "application/json"}})
+        )
