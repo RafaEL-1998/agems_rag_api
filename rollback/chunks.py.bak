@@ -169,6 +169,7 @@ class TipoElemento(Enum):
     ALINEA = "alinea"
     ITEM = "item"
     ANEXO = "anexo"
+    CLAUSULA = "clausula"
 
 @dataclass
 class ElementoRegulatorio:
@@ -201,19 +202,38 @@ class ChunkerRegulatorio:
             'alinea': re.compile(r'^([a-z])\)\s*(.+?)$', re.MULTILINE),
             'item': re.compile(r'^\s*(\d+)\.(?!\d)\s+(.+?)$', re.MULTILINE),
             'anexo': re.compile(r'^ANEXO\s+([IVXLCDM]+|[0-9]+|[A-Z])\s*[-–—]?\s*(.+?)$', re.IGNORECASE | re.MULTILINE),
-            'revogado': re.compile(r'\((?:revogad[oa]|suprimid[oa]|exclu[íi]d[oa]|eliminad[oa])\)', re.IGNORECASE),
+            'clausula': re.compile(r'^CLÁUSULA\s+([A-ZÇÃÕ0-9ºª]+(?:\s+[A-ZÇÃÕ]+)?)\s*[:–—]?\s*(.+?)$', re.IGNORECASE | re.MULTILINE),
+            'revogado': re.compile(r'\((?:revogad[oa]|suprimid[oa]|exclu[íi]d[oa]|eliminad[oa]).*?\)', re.IGNORECASE),
             'marcador_pagina': re.compile(r'\[\[PAGINA:(\d+)\]\]', re.MULTILINE),
             'trash': [
-                r'Este texto não substitui o publicado no Diário Oficial.*',
+                r'Este texto não substitui o (?:publicado|republicado) no D\.O\..*',
+                r'Este texto não substitui o (?:publicado|republicado) no Diário Oficial.*',
                 r'Publicado no DOU de \d{2}/\d{2}/\d{2}.*',
                 r'Diário Oficial da União\s?-\s?Seção\s?\d+.*',
                 r'Page \d+ of \d+.*',
                 r'^\s*\d+\s*$',
-                r'\d{2}/\d{2}/\d{2},\s\d{2}:\d{2}'
+                r'\d{2}/\d{2}/\d{2},\s\d{2}:\d{2}',
+                r'\(\*\)\s*Republicado em razão de incorreções.*',
+                r'ANDRÉ PEPITONE DA NÓBREGA',
+                r'HÉLVIO NEVES GUERRA',
+                r'SANDRO LAZZARI'
             ]
         }
 
     def limpar_texto(self, texto: str) -> str:
+        # Assinaturas e Disclaimers (padrões multiline simples)
+        padrões_lixo = [
+            r'(?i)ANDRÉ\s+PEPITONE\s+DA\s+NÓBREGA',
+            r'(?i)HÉLVIO\s+NEVES\s+GUERRA',
+            r'(?i)SANDRO\s+LAZZARI',
+            r'(?i)ÍNDICE',
+            r'(?i)Este texto não substitui o (?:publicado|republicado).*',
+            r'(?i)retificado no D\.O\. de .*',
+            r'(?i)\(\*\)\s*Republicado em razão de incorreções.*'
+        ]
+        for p in padrões_lixo:
+            texto = re.sub(p, '', texto, flags=re.MULTILINE)
+
         for p in self.padroes['trash']:
             texto = re.sub(p, '', texto, flags=re.IGNORECASE | re.MULTILINE)
         
@@ -226,8 +246,16 @@ class ChunkerRegulatorio:
         return texto.strip()
 
     def _normalizar_estrutura(self, texto: str) -> str:
-        padroes = [r'(?<!^)(TÍTULO\s+)', r'(?<!^)(CAPÍTULO\s+)', r'(?<!^)(SEÇÃO\s+)', r'(?<!^)(SUBSEÇÃO\s+)', r'(?<!^)(ANEXO\s+)']
-        for p in padroes: texto = re.sub(p, r'\n\1', texto, flags=re.MULTILINE)
+        # Só quebra se for início de sentença ou linha isolada
+        quebras_duplas = [r'([.;!?])\s*(TÍTULO\s+)', r'([.;!?])\s*(CAPÍTULO\s+)', r'([.;!?])\s*(SEÇÃO\s+)', 
+                          r'([.;!?])\s*(SUBSEÇÃO\s+)']
+        for p in quebras_duplas: texto = re.sub(p, r'\1\n\2', texto)
+        
+        # Garante que Anexos no início de linhas sejam preservados com quebra forte
+        texto = re.sub(r'([.;!?])\s*(ANEXO\s+[IVXLCDM0-9A-Z]+)', r'\1\n\n\2', texto)
+        texto = re.sub(r'(?m)^ *(ANEXO\s+[IVXLCDM0-9A-Z]+)', r'\n\1', texto) 
+        
+        # Corrige quebras de Artigos grudados
         return re.sub(r'([a-z0-9áàâãéêíóôõúç);:])\s+(Art\.?\s*\d+)', r'\1\n\2', texto)
 
     def parse_documento(self, texto: str) -> List[ElementoRegulatorio]:
@@ -255,21 +283,56 @@ class ChunkerRegulatorio:
             # Detecção de Elemento com Validação de Sequência
             elemento_id = None
             
+            # Auxiliar para converter romano em inteiro
+            def romano_para_int(s: str) -> int:
+                val = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100, 'D': 500, 'M': 1000}
+                s = s.upper()
+                res = 0
+                for i in range(len(s)):
+                    if i > 0 and val[s[i]] > val[s[i-1]]:
+                        res += val[s[i]] - 2 * val[s[i-1]]
+                    else:
+                        res += val[s[i]]
+                return res
+
+            # Auxiliar para obter o escopo estável do pai
+            def obter_escopo_pai(tipo: TipoElemento) -> str:
+                niveis = {
+                    TipoElemento.RESOLUCAO: 0, TipoElemento.TITULO: 1, TipoElemento.ANEXO: 1,
+                    TipoElemento.CAPITULO: 2, TipoElemento.SECAO: 3, TipoElemento.SUBSECAO: 4, 
+                    TipoElemento.ARTIGO: 5, TipoElemento.CLAUSULA: 5, TipoElemento.PARAGRAFO: 6, 
+                    TipoElemento.INCISO: 7, TipoElemento.ALINEA: 8, TipoElemento.ITEM: 9
+                }
+                n_alvo = niveis.get(tipo, 10)
+                if n_alvo <= 5: return "doc" # Artigos (e Títulos/Anexos) são escopo global
+                
+                curr = elemento_atual
+                while curr and curr.nivel >= n_alvo:
+                    curr = curr.pai
+                if not curr: return "doc"
+                return f"{curr.contexto_hierarquico} > {curr.tipo.value}_{curr.numero}"
+
             # Auxiliar para validar se o número faz sentido na sequência atual
-            def validar_seq(tipo: TipoElemento, num_str: str, ctx_pai: str) -> bool:
+            def validar_seq(tipo: TipoElemento, num_str: str) -> bool:
                 if num_str == "único": return True
                 try: 
-                    # Extrai apenas o número principal (ex: 1-A -> 1)
-                    num = int(re.findall(r'\d+', num_str)[0])
+                    if tipo == TipoElemento.INCISO:
+                        m_rom = re.match(r'^([IVXLCDM]+)', num_str, re.IGNORECASE)
+                        num = romano_para_int(m_rom.group(1)) if m_rom else 1
+                    elif tipo == TipoElemento.ALINEA:
+                        num = ord(num_str.lower()[0]) - ord('a') + 1
+                    else:
+                        num = int(re.findall(r'\d+', num_str)[0])
+                    
+                    ctx_pai = obter_escopo_pai(tipo)
                     key = f"{ctx_pai}|{tipo.value}"
                     ult = sequencias.get(key, 0)
                     
-                    # Se for o primeiro, ou for o próximo (n+1), ou se estivermos em modo "compilação" (aceita repetição imediata para troca de redação)
                     if num == 1 or num == ult + 1 or num == ult:
                         sequencias[key] = num
                         return True
                     return False
-                except: return True # Se não for numérico puro, aceita por segurança
+                except: return True 
 
             # Tenta encontrar match com os padrões
             if m := self.padroes['resolucao'].match(linha):
@@ -281,24 +344,31 @@ class ChunkerRegulatorio:
             elif m := self.padroes['secao'].match(linha):
                 elemento_id = ElementoRegulatorio(TipoElemento.SECAO, m.group(1), linha, 3, pagina_atual)
             elif m := self.padroes['artigo'].match(linha):
-                if validar_seq(TipoElemento.ARTIGO, m.group(1), "doc"):
+                if validar_seq(TipoElemento.ARTIGO, m.group(1)):
                     elemento_id = ElementoRegulatorio(TipoElemento.ARTIGO, m.group(1), linha, 5, pagina_atual)
+            elif m := self.padroes['clausula'].match(linha):
+                elemento_id = ElementoRegulatorio(TipoElemento.CLAUSULA, m.group(1), linha, 5, pagina_atual)
+            elif m := self.padroes['anexo'].match(linha):
+                elemento_id = ElementoRegulatorio(TipoElemento.ANEXO, m.group(1), linha, 1, pagina_atual)
+                # Reset sequências locais ao entrar em novo anexo para evitar conflitos de numeração
+                for k in list(sequencias.keys()):
+                    if "|" in k and not k.startswith("doc|"):
+                        del sequencias[k]
             elif m := self.padroes['paragrafo_unico'].match(linha):
                 elemento_id = ElementoRegulatorio(TipoElemento.PARAGRAFO, "único", linha, 6, pagina_atual)
             elif m := self.padroes['paragrafo'].match(linha):
-                ctx = elemento_atual.contexto_hierarquico if elemento_atual else ""
-                # Se a frase termina com "da", "do", "ao", "do art", é 100% referência
                 if not re.search(r'(?:o|a|ao|do|da|no|na|pelo|pela|dos|das|art\.?|caput)\s+$', '\n'.join(texto_acumulado)[-30:], re.I):
-                    if validar_seq(TipoElemento.PARAGRAFO, m.group(1), ctx):
+                    if validar_seq(TipoElemento.PARAGRAFO, m.group(1)):
                         elemento_id = ElementoRegulatorio(TipoElemento.PARAGRAFO, m.group(1), linha, 6, pagina_atual)
             elif m := self.padroes['inciso'].match(linha):
-                ctx = elemento_atual.contexto_hierarquico if elemento_atual else ""
-                if validar_seq(TipoElemento.INCISO, m.group(1), ctx):
+                if validar_seq(TipoElemento.INCISO, m.group(1)):
                     elemento_id = ElementoRegulatorio(TipoElemento.INCISO, m.group(1), linha, 7, pagina_atual)
             elif m := self.padroes['alinea'].match(linha):
-                elemento_id = ElementoRegulatorio(TipoElemento.ALINEA, m.group(1), linha, 8, pagina_atual)
+                if validar_seq(TipoElemento.ALINEA, m.group(1)):
+                    elemento_id = ElementoRegulatorio(TipoElemento.ALINEA, m.group(1), linha, 8, pagina_atual)
             elif m := self.padroes['item'].match(linha):
-                elemento_id = ElementoRegulatorio(TipoElemento.ITEM, m.group(1), linha, 9, pagina_atual)
+                if validar_seq(TipoElemento.ITEM, m.group(1)):
+                    elemento_id = ElementoRegulatorio(TipoElemento.ITEM, m.group(1), linha, 9, pagina_atual)
 
             if elemento_id:
                 if elemento_atual: 
@@ -362,8 +432,20 @@ class ChunkerRegulatorio:
 
     def _estabelecer_hierarquia(self, elementos: List[ElementoRegulatorio]):
         pilha = []
-        nomes = {TipoElemento.TITULO: "Título", TipoElemento.CAPITULO: "Capítulo", TipoElemento.SECAO: "Seção", 
-                 TipoElemento.ARTIGO: "Artigo", TipoElemento.PARAGRAFO: "Parágrafo", TipoElemento.INCISO: "Inciso", TipoElemento.ALINEA: "Alínea"}
+        nomes = {
+            TipoElemento.RESOLUCAO: "Resolução",
+            TipoElemento.TITULO: "Título",
+            TipoElemento.CAPITULO: "Capítulo",
+            TipoElemento.SECAO: "Seção",
+            TipoElemento.SUBSECAO: "Subseção",
+            TipoElemento.ARTIGO: "Artigo",
+            TipoElemento.PARAGRAFO: "Parágrafo",
+            TipoElemento.INCISO: "Inciso",
+            TipoElemento.ALINEA: "Alínea",
+            TipoElemento.ITEM: "Item",
+            TipoElemento.ANEXO: "Anexo",
+            TipoElemento.CLAUSULA: "Cláusula"
+        }
         
         for e in elementos:
             while pilha and pilha[-1].nivel >= e.nivel: pilha.pop()
@@ -388,11 +470,13 @@ class ChunkerRegulatorio:
         chunk_id = 0
         
         for e in elementos:
-            # Marcadores estruturais (Título/Capítulo/Seção) mesmo se curtos
-            if e.tipo in [TipoElemento.TITULO, TipoElemento.CAPITULO, TipoElemento.SECAO] and len(e.texto) < 200:
-                chunks.append(self._formatar_chunk(f"MARCADOR_ESTRUTURAL: {e.texto}", e, chunk_id))
-                chunk_id += 1
-                continue
+            # Marcadores estruturais (Título/Capítulo/Seção/Anexo) mesmo se curtos
+            if e.tipo in [TipoElemento.TITULO, TipoElemento.CAPITULO, TipoElemento.SECAO, TipoElemento.ANEXO]:
+                # Chunks de marcadores são sempre preservados para manter a estrutura do índice
+                if len(e.texto) < 300:
+                    chunks.append(self._formatar_chunk(f"MARCADOR_ESTRUTURAL: {e.texto}", e, chunk_id))
+                    chunk_id += 1
+                    continue
             
             if e.tipo == TipoElemento.SUBSECAO and len(e.texto) < 100: continue
 
