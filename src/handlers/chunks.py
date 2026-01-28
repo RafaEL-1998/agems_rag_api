@@ -1,47 +1,579 @@
-from js import Response, JSON
-from pyodide.ffi import to_js
-import json
-from utils.vectorize import process_and_vectorize_chunks
+"""
+Chunker Hierárquico e Semântico para Documentos Regulatórios
+Otimizado para Resoluções ANEEL e textos legais brasileiros
 
-async def handle_add_chunks(request, env):
+Este é o módulo central de processamento documental da AGEMS.
+Consolida extração de PDF, análise semântica e segmentação hierárquica.
+"""
+
+import re
+import json
+import io
+import uuid
+import os
+import sys
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+import pdfplumber
+
+# ================================================================================
+# 1. ANÁLISE SEMÂNTICA & AUXILIARES
+# ================================================================================
+
+class AnalisadorRegulatorio:
+    """Classe para análise e extração de informações regulatórias semânticas"""
+    
+    @staticmethod
+    def extrair_referencias_cruzadas(texto: str) -> List[str]:
+        """Extrai referências cruzadas a outros artigos, parágrafos ou leis"""
+        referencias = []
+        padroes = [
+            r'art(?:igo)?\.?\s+(\d+(?:-[A-Z])?)[ºo°]?',
+            r'§\s*(\d+(?:-[A-Z])?)[ºo°]?',
+            r'inciso\s+([IVXLCDM]+(?:-[A-Z])?)',
+            r'Lei\s+n[ºo°]?\s*[\d.]+/\d{4}',
+            r'Decreto\s+n[ºo°]?\s*[\d.]+/\d{4}',
+            r'Resolução\s+(?:Normativa\s+)?n[ºo°]?\s*[\d.]+/\d{4}',
+        ]
+        for padrao in padroes:
+            matches = re.finditer(padrao, texto, re.IGNORECASE)
+            referencias.extend([m.group(0) for m in matches])
+        return list(set(referencias))
+    
+    @staticmethod
+    def extrair_valores_numericos(texto: str) -> Dict[str, List]:
+        """Extrai valores numéricos importantes (potências, prazos, multas, porcentagens)"""
+        valores = {
+            'potencias_mw': [],
+            'porcentagens': [],
+            'prazos_dias': [],
+            'valores_monetarios': []
+        }
+        
+        # Potências em MW/kW
+        potencias = re.finditer(r'(\d+(?:[.,]\d+)?)\s*(?:MW|kW)', texto, re.IGNORECASE)
+        valores['potencias_mw'] = [m.group(0) for m in potencias]
+        
+        # Porcentagens
+        porcentagens = re.finditer(r'(\d+(?:[.,]\d+)?)\s*%', texto)
+        valores['porcentagens'] = [m.group(0) for m in porcentagens]
+        
+        # Prazos em dias/meses
+        prazos = re.finditer(r'(\d+)\s*(?:dias|meses)', texto, re.IGNORECASE)
+        valores['prazos_dias'] = [m.group(0) for m in prazos]
+        
+        # Valores monetários
+        monetarios = re.finditer(r'R\$\s*[\d.,]+', texto)
+        valores['valores_monetarios'] = [m.group(0) for m in monetarios]
+        
+        return valores
+    
+    @staticmethod
+    def identificar_obrigacoes(texto: str) -> List[str]:
+        """Identifica verbos e locuções que indicam obrigatoriedade"""
+        obrigacoes = []
+        padroes = [
+            r'deverá\s+[^.;]+',
+            r'é\s+obrigat[oó]rio\s+[^.;]+',
+            r'deve\s+[^.;]+',
+            r'fica\s+obrigad[oa]\s+[^.;]+',
+        ]
+        for padrao in padroes:
+            matches = re.finditer(padrao, texto, re.IGNORECASE)
+            obrigacoes.extend([m.group(0) for m in matches])
+        return obrigacoes
+    
+    @staticmethod
+    def identificar_vedacoes(texto: str) -> List[str]:
+        """Identifica proibições e vedações"""
+        vedacoes = []
+        padroes = [
+            r'não\s+poder[áa]\s+[^.;]+',
+            r'é\s+vedado\s+[^.;]+',
+            r'fica\s+proibid[oa]\s+[^.;]+',
+            r'não\s+ser[áa]\s+permitido\s+[^.;]+',
+        ]
+        for padrao in padroes:
+            matches = re.finditer(padrao, texto, re.IGNORECASE)
+            vedacoes.extend([m.group(0) for m in matches])
+        return vedacoes
+
+class OtimizadorConsultas:
+    """Otimizador para expansão de termos de busca em regulação"""
+    @staticmethod
+    def expandir_query(query: str) -> List[str]:
+        queries = [query]
+        sinonimos = {
+            'autorização': ['outorga', 'permissão', 'concessão'],
+            'empreendimento': ['projeto', 'instalação', 'usina'],
+            'potência': ['capacidade instalada', 'geração'],
+            'consumidor': ['usuário', 'titular'],
+            'faturamento': ['cobrança', 'conta de luz']
+        }
+        query_lower = query.lower()
+        for termo, s_list in sinonimos.items():
+            if termo in query_lower:
+                for s in s_list:
+                    queries.append(query_lower.replace(termo, s))
+        return queries
+
+# ================================================================================
+# 2. EXTRAÇÃO DE PDF (PDFPLUMBER)
+# ================================================================================
+
+async def extract_text_from_pdf(env, r2_key, start_page=1, limit_pages=100):
     """
-    Recebe chunks de texto prontos, gera embeddings e salva no Vectorize.
+    Extrai texto de um PDF armazenado no R2 usando pdfplumber.
+    Injeta marcadores de página para preservação de metadados.
+    """
+    # 1. Recuperar objeto do R2
+    obj = await env.agems_docs.get(r2_key)
+    if not obj:
+        raise Exception(f"Arquivo não encontrado: {r2_key}")
+
+    # 2. Converter para bytes e buffer de memória
+    from js import Uint8Array
+    pdf_bytes = bytes(Uint8Array.new(await obj.arrayBuffer()))
+    
+    texto_acumulado = []
+    
+    # 3. Usar pdfplumber para extração rica
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        total_pages = len(pdf.pages)
+        end_page = min(start_page + limit_pages - 1, total_pages)
+        
+        for i in range(start_page - 1, end_page):
+            page = pdf.pages[i]
+            text = page.extract_text(x_tolerance=2, y_tolerance=3, layout=True)
+            if text:
+                texto_acumulado.append(f"[[PAGINA:{i+1}]]\n{text}")
+                
+    return "\n\n".join(texto_acumulado), total_pages
+
+# ================================================================================
+# 3. SEGMENTAÇÃO HIERÁRQUICA (CHUNKING)
+# ================================================================================
+
+class TipoElemento(Enum):
+    PREAMBULO = "preambulo"
+    RESOLUCAO = "resolucao"
+    TITULO = "titulo"
+    CAPITULO = "capitulo"
+    SECAO = "secao"
+    SUBSECAO = "subsecao"
+    ARTIGO = "artigo"
+    PARAGRAFO = "paragrafo"
+    INCISO = "inciso"
+    ALINEA = "alinea"
+    ITEM = "item"
+    ANEXO = "anexo"
+
+@dataclass
+class ElementoRegulatorio:
+    tipo: TipoElemento
+    numero: str
+    texto: str
+    nivel: int
+    pagina: int = 1
+    revogado: bool = False
+    pai: Optional['ElementoRegulatorio'] = None
+    contexto_hierarquico: str = ""
+
+class ChunkerRegulatorio:
+    def __init__(self, tamanho_max_chunk: int = 1000, overlap_chars: int = 200, manter_contexto: bool = True):
+        self.tamanho_max_chunk = tamanho_max_chunk
+        self.overlap_chars = overlap_chars
+        self.manter_contexto = manter_contexto
+        self.analisador = AnalisadorRegulatorio()
+        
+        self.padroes = {
+            'resolucao': re.compile(r'^RESOLUÇÃO\s+(?:NORMATIV\s*A\s+)?N[ºo°]?\s*(\d+(?:[.,]\d+)?)[,/]\s*DE\s+\d+', re.IGNORECASE | re.MULTILINE),
+            'titulo': re.compile(r'^TÍTULO\s+([IVXLCDM]+|[0-9]+|(?:DAS|DOS|DA|DO)\s+.+?)\s*(?:[-–—]\s*)?(.+)?$', re.IGNORECASE | re.MULTILINE),
+            'capitulo': re.compile(r'^CAPÍTULO\s+([IVXLCDM]+|[0-9]+)\s*(?:[-–—]\s*)?(.+)?$', re.IGNORECASE | re.MULTILINE),
+            'secao': re.compile(r'^SEÇÃO\s+([IVXLCDM]+|[0-9]+)\s*(?:[-–—]\s*)?(.+)?$', re.IGNORECASE | re.MULTILINE),
+            'subsecao': re.compile(r'^SUBSEÇÃO\s+([IVXLCDM]+|[0-9]+)\s*(?:[-–—]\s*)?(.+)?$', re.IGNORECASE | re.MULTILINE),
+            'artigo': re.compile(r'^Art\.?\s+(\d+(?:-[A-Z])?)[ºo°]?\s*[-–—]?\s*(.+?)$', re.MULTILINE),
+            'paragrafo': re.compile(r'^§\s*(\d+(?:-[A-Z])?)[ºo°]?\s*[-–—]?\s*(.+?)$', re.MULTILINE),
+            'paragrafo_unico': re.compile(r'^Parágrafo\s+único\.?\s*[-–—]?\s*(.+?)$', re.IGNORECASE | re.MULTILINE),
+            'inciso': re.compile(r'^([IVXLCDM]+(?:-[A-Z])?)\s*[-–—]\s*(.+?)$', re.MULTILINE),
+            'alinea': re.compile(r'^([a-z])\)\s*(.+?)$', re.MULTILINE),
+            'item': re.compile(r'^\s*(\d+)\.(?!\d)\s+(.+?)$', re.MULTILINE),
+            'anexo': re.compile(r'^ANEXO\s+([IVXLCDM]+|[0-9]+|[A-Z])\s*[-–—]?\s*(.+?)$', re.IGNORECASE | re.MULTILINE),
+            'revogado': re.compile(r'\((?:revogad[oa]|suprimid[oa]|exclu[íi]d[oa]|eliminad[oa])\)', re.IGNORECASE),
+            'marcador_pagina': re.compile(r'\[\[PAGINA:(\d+)\]\]', re.MULTILINE),
+            'trash': [
+                r'Este texto não substitui o publicado no Diário Oficial.*',
+                r'Publicado no DOU de \d{2}/\d{2}/\d{2}.*',
+                r'Diário Oficial da União\s?-\s?Seção\s?\d+.*',
+                r'Page \d+ of \d+.*',
+                r'^\s*\d+\s*$',
+                r'\d{2}/\d{2}/\d{2},\s\d{2}:\d{2}'
+            ]
+        }
+
+    def limpar_texto(self, texto: str) -> str:
+        for p in self.padroes['trash']:
+            texto = re.sub(p, '', texto, flags=re.IGNORECASE | re.MULTILINE)
+        
+        char_fixes = {
+            'TÃTULO': 'TÍTULO', 'CAPÃTULO': 'CAPÍTULO', 'Ã§Ã£o': 'ção', 'Ã§Ãµes': 'ções',
+            'Ã¡': 'á', 'Ã©': 'é', 'Ã­': 'í', 'Ã³': 'ó', 'Ãº': 'ú', 'Ã': 'à', 'Ãª': 'ê', 
+            'Ã´': 'ô', 'Ã§': 'ç', 'à': 'ã'
+        }
+        for b, f in char_fixes.items(): texto = texto.replace(b, f)
+        return texto.strip()
+
+    def _normalizar_estrutura(self, texto: str) -> str:
+        padroes = [r'(?<!^)(TÍTULO\s+)', r'(?<!^)(CAPÍTULO\s+)', r'(?<!^)(SEÇÃO\s+)', r'(?<!^)(SUBSEÇÃO\s+)', r'(?<!^)(ANEXO\s+)']
+        for p in padroes: texto = re.sub(p, r'\n\1', texto, flags=re.MULTILINE)
+        return re.sub(r'([a-z0-9áàâãéêíóôõúç);:])\s+(Art\.?\s*\d+)', r'\1\n\2', texto)
+
+    def parse_documento(self, texto: str) -> List[ElementoRegulatorio]:
+        texto = self.limpar_texto(texto)
+        texto = self._normalizar_estrutura(texto)
+        elementos = []
+        linhas = texto.split('\n')
+        
+        elemento_atual = None
+        texto_acumulado = []
+        pagina_atual = 1
+        
+        # Rastreio de sequência para evitar falsos positivos (referências cruzadas)
+        # Formato: {contexto_pai: {tipo: ultimo_numero}}
+        sequencias = {}
+
+        for linha in linhas:
+            linha = linha.strip()
+            if not linha: continue
+            
+            if m_pag := self.padroes['marcador_pagina'].match(linha):
+                pagina_atual = int(m_pag.group(1))
+                continue
+
+            # Detecção de Elemento com Validação de Sequência
+            elemento_id = None
+            
+            # Auxiliar para converter romano em inteiro
+            def romano_para_int(s: str) -> int:
+                val = {'I': 1, 'V': 5, 'X': 10, 'L': 50, 'C': 100, 'D': 500, 'M': 1000}
+                s = s.upper()
+                res = 0
+                for i in range(len(s)):
+                    if i > 0 and val[s[i]] > val[s[i-1]]:
+                        res += val[s[i]] - 2 * val[s[i-1]]
+                    else:
+                        res += val[s[i]]
+                return res
+
+            # Auxiliar para obter o escopo estável do pai
+            def obter_escopo_pai(tipo: TipoElemento) -> str:
+                niveis = {
+                    TipoElemento.RESOLUCAO: 0, TipoElemento.TITULO: 1, TipoElemento.CAPITULO: 2, 
+                    TipoElemento.SECAO: 3, TipoElemento.SUBSECAO: 4, TipoElemento.ARTIGO: 5, 
+                    TipoElemento.PARAGRAFO: 6, TipoElemento.INCISO: 7, TipoElemento.ALINEA: 8, 
+                    TipoElemento.ITEM: 9
+                }
+                n_alvo = niveis.get(tipo, 10)
+                if n_alvo <= 5: return "doc" # Artigos e acima são escopo global
+                
+                curr = elemento_atual
+                while curr and curr.nivel >= n_alvo:
+                    curr = curr.pai
+                if not curr: return "doc"
+                return f"{curr.contexto_hierarquico} > {curr.tipo.value}_{curr.numero}"
+
+            # Auxiliar para validar se o número faz sentido na sequência atual
+            def validar_seq(tipo: TipoElemento, num_str: str) -> bool:
+                if num_str == "único": return True
+                try: 
+                    if tipo == TipoElemento.INCISO:
+                        m_rom = re.match(r'^([IVXLCDM]+)', num_str, re.IGNORECASE)
+                        num = romano_para_int(m_rom.group(1)) if m_rom else 1
+                    elif tipo == TipoElemento.ALINEA:
+                        num = ord(num_str.lower()[0]) - ord('a') + 1
+                    else:
+                        num = int(re.findall(r'\d+', num_str)[0])
+                    
+                    ctx_pai = obter_escopo_pai(tipo)
+                    key = f"{ctx_pai}|{tipo.value}"
+                    ult = sequencias.get(key, 0)
+                    
+                    if num == 1 or num == ult + 1 or num == ult:
+                        sequencias[key] = num
+                        return True
+                    return False
+                except: return True 
+
+            # Tenta encontrar match com os padrões
+            if m := self.padroes['resolucao'].match(linha):
+                elemento_id = ElementoRegulatorio(TipoElemento.RESOLUCAO, m.group(1), linha, 0, pagina_atual)
+            elif m := self.padroes['titulo'].match(linha):
+                elemento_id = ElementoRegulatorio(TipoElemento.TITULO, m.group(1), linha, 1, pagina_atual)
+            elif m := self.padroes['capitulo'].match(linha):
+                elemento_id = ElementoRegulatorio(TipoElemento.CAPITULO, m.group(1), linha, 2, pagina_atual)
+            elif m := self.padroes['secao'].match(linha):
+                elemento_id = ElementoRegulatorio(TipoElemento.SECAO, m.group(1), linha, 3, pagina_atual)
+            elif m := self.padroes['artigo'].match(linha):
+                if validar_seq(TipoElemento.ARTIGO, m.group(1)):
+                    elemento_id = ElementoRegulatorio(TipoElemento.ARTIGO, m.group(1), linha, 5, pagina_atual)
+            elif m := self.padroes['paragrafo_unico'].match(linha):
+                elemento_id = ElementoRegulatorio(TipoElemento.PARAGRAFO, "único", linha, 6, pagina_atual)
+            elif m := self.padroes['paragrafo'].match(linha):
+                if not re.search(r'(?:o|a|ao|do|da|no|na|pelo|pela|dos|das|art\.?|caput)\s+$', '\n'.join(texto_acumulado)[-30:], re.I):
+                    if validar_seq(TipoElemento.PARAGRAFO, m.group(1)):
+                        elemento_id = ElementoRegulatorio(TipoElemento.PARAGRAFO, m.group(1), linha, 6, pagina_atual)
+            elif m := self.padroes['inciso'].match(linha):
+                if validar_seq(TipoElemento.INCISO, m.group(1)):
+                    elemento_id = ElementoRegulatorio(TipoElemento.INCISO, m.group(1), linha, 7, pagina_atual)
+            elif m := self.padroes['alinea'].match(linha):
+                if validar_seq(TipoElemento.ALINEA, m.group(1)):
+                    elemento_id = ElementoRegulatorio(TipoElemento.ALINEA, m.group(1), linha, 8, pagina_atual)
+            elif m := self.padroes['item'].match(linha):
+                if validar_seq(TipoElemento.ITEM, m.group(1)):
+                    elemento_id = ElementoRegulatorio(TipoElemento.ITEM, m.group(1), linha, 9, pagina_atual)
+
+            if elemento_id:
+                if elemento_atual: 
+                    elemento_atual.texto = '\n'.join(texto_acumulado)
+                    elementos.append(elemento_atual)
+                else: 
+                    # Preâmbulo inicial
+                    if texto_acumulado:
+                        text_pre = '\n'.join(texto_acumulado)
+                        elementos.append(ElementoRegulatorio(TipoElemento.PREAMBULO, "0", text_pre, 0, 1, contexto_hierarquico="Preâmbulo"))
+                
+                elemento_atual = elemento_id
+                texto_acumulado = [linha]
+                # Atualizar hierarquia temporária para o próximo validar_seq
+                self._estabelecer_hierarquia(elementos + [elemento_atual])
+            else:
+                texto_acumulado.append(linha)
+        
+        if elemento_atual:
+            elemento_atual.texto = '\n'.join(texto_acumulado)
+            elementos.append(elemento_atual)
+            
+        self._estabelecer_hierarquia(elementos)
+        return self._deduplicar_elementos(elementos)
+
+    def _deduplicar_elementos(self, elementos: List[ElementoRegulatorio]) -> List[ElementoRegulatorio]:
+        """
+        Deduplicação Inteligente:
+        - Prioriza versões com "(Redação dada por...)" ou "(Incluído por...)".
+        - Em caso de mesma hierarquia, mantém a versão mais recente e completa.
+        """
+        mapa_final = {}
+        for e in elementos:
+            if e.tipo == TipoElemento.PREAMBULO: continue
+            chave = f"{e.tipo.value}|{e.numero}|{e.contexto_hierarquico}"
+            
+            if chave not in mapa_final:
+                mapa_final[chave] = e
+            else:
+                # Heurística de substituição
+                existente = mapa_final[chave]
+                nova_redacao = any(x in e.texto.lower() for x in ["redação dada", "incluído pela", "incluída pela"])
+                antiga_revogada = any(x in existente.texto.lower() for x in ["revogado", "suprimido", "excluído"])
+                
+                # Substitui se a nova for explicitamente uma alteração ou se a antiga sumiu/é menor
+                if nova_redacao or antiga_revogada or len(e.texto) > len(existente.texto) * 1.5:
+                    mapa_final[chave] = e
+        
+        # Preserva a ordem original de aparição da chave
+        final_list = []
+        vistos = set()
+        for e in elementos:
+            chave = f"{e.tipo.value}|{e.numero}|{e.contexto_hierarquico}" if e.tipo != TipoElemento.PREAMBULO else "PREAMBULO"
+            if chave == "PREAMBULO":
+                final_list.append(e)
+                continue
+            if chave not in vistos:
+                final_list.append(mapa_final[chave])
+                vistos.add(chave)
+        return final_list
+
+    def _estabelecer_hierarquia(self, elementos: List[ElementoRegulatorio]):
+        pilha = []
+        nomes = {
+            TipoElemento.RESOLUCAO: "Resolução",
+            TipoElemento.TITULO: "Título",
+            TipoElemento.CAPITULO: "Capítulo",
+            TipoElemento.SECAO: "Seção",
+            TipoElemento.SUBSECAO: "Subseção",
+            TipoElemento.ARTIGO: "Artigo",
+            TipoElemento.PARAGRAFO: "Parágrafo",
+            TipoElemento.INCISO: "Inciso",
+            TipoElemento.ALINEA: "Alínea",
+            TipoElemento.ITEM: "Item",
+            TipoElemento.ANEXO: "Anexo"
+        }
+        
+        for e in elementos:
+            while pilha and pilha[-1].nivel >= e.nivel: pilha.pop()
+            if pilha: e.pai = pilha[-1]
+            
+            # Contexto
+            parts = []
+            curr = e
+            while curr and curr.pai:
+                curr = curr.pai
+                if curr.tipo in nomes:
+                    prefix = f"{nomes[curr.tipo]} {curr.numero}"
+                    if curr.tipo == TipoElemento.PARAGRAFO: prefix = f"§ {curr.numero}" if curr.numero != "único" else "Parágrafo Único"
+                    elif curr.tipo == TipoElemento.INCISO: prefix = f"Inc. {curr.numero}"
+                    parts.insert(0, prefix)
+            e.contexto_hierarquico = " > ".join(parts)
+            pilha.append(e)
+
+    def criar_chunks(self, texto: str) -> List[Dict]:
+        elementos = [e for e in self.parse_documento(texto) if not self.padroes['revogado'].search(e.texto)]
+        chunks = []
+        chunk_id = 0
+        
+        for e in elementos:
+            # Marcadores estruturais (Título/Capítulo/Seção) mesmo se curtos
+            if e.tipo in [TipoElemento.TITULO, TipoElemento.CAPITULO, TipoElemento.SECAO] and len(e.texto) < 200:
+                chunks.append(self._formatar_chunk(f"MARCADOR_ESTRUTURAL: {e.texto}", e, chunk_id))
+                chunk_id += 1
+                continue
+            
+            if e.tipo == TipoElemento.SUBSECAO and len(e.texto) < 100: continue
+
+            if len(e.texto) <= self.tamanho_max_chunk:
+                chunks.append(self._formatar_chunk(e.texto, e, chunk_id))
+                chunk_id += 1
+            else:
+                for sub in self._dividir_texto(e):
+                    chunks.append(self._formatar_chunk(sub, e, chunk_id, parte=True))
+                    chunk_id += 1
+        return chunks
+
+    def _formatar_chunk(self, texto: str, e: ElementoRegulatorio, cid: int, parte: bool = False) -> Dict:
+        prefix = f"[{e.contexto_hierarquico}] " if e.contexto_hierarquico else ""
+        return {
+            'chunk_id': f"chunk_{cid}",
+            'texto': f"{prefix}{texto}",
+            'tipo': e.tipo.value,
+            'numero': e.numero,
+            'nivel': e.nivel,
+            'contexto_hierarquico': e.contexto_hierarquico,
+            'pagina': e.pagina,
+            'tamanho': len(texto),
+            'parte_de_elemento_maior': parte,
+            'semantica': {
+                'obrigacoes': self.analisador.identificar_obrigacoes(texto),
+                'vedacoes': self.analisador.identificar_vedacoes(texto),
+                'referencias': self.analisador.extrair_referencias_cruzadas(texto),
+                'valores': self.analisador.extrair_valores_numericos(texto)
+            }
+        }
+
+    def _dividir_texto(self, e: ElementoRegulatorio) -> List[str]:
+        sentencas = re.split(r'(?<=[.;!?])\s+', e.texto)
+        chunks = []
+        atual = ""
+        for s in sentencas:
+            if len(atual) + len(s) > self.tamanho_max_chunk:
+                if atual: chunks.append(atual)
+                atual = s
+            else: atual += (' ' if atual else '') + s
+        if atual: chunks.append(atual)
+        return chunks
+
+# ================================================================================
+# 4. HANDLERS E UTILITÁRIOS DE EXECUÇÃO
+# ================================================================================
+
+async def handle_process(request, env):
+    """
+    Handler principal para processamento de documentos no Cloudflare Worker.
+    Substitui a lógica anterior e utiliza pdfplumber via extract_text_from_pdf local.
     """
     try:
-        url_obj = request.url
-        document_id = url_obj.split("/documents/")[1].split("/chunks")[0]
+        from js import JSON
+        from pyodide.ffi import to_js
+        from utils.vectorize import process_and_vectorize_chunks
+
+        body = (await request.json()).to_py()
+        document_id = body.get("document_id")
+        start_chunk = body.get("start_chunk", 0)
+        limit_chunks = body.get("limit_chunks", 50)
+
+        if not document_id:
+            return Response.new(json.dumps({"error": "document_id is required"}), to_js({"status": 400}))
+
+        # 1. Buscar metadados no D1
+        doc_result = (await env.agems_rag_db.prepare("SELECT * FROM documents WHERE id = ?").bind(document_id).first()).to_py()
+        if not doc_result:
+            return Response.new(json.dumps({"error": "Document not found"}), to_js({"status": 404}))
+
+        # 2. Extrair texto do PDF (100 páginas por vez)
+        full_text, total_pages = await extract_text_from_pdf(env, doc_result["r2_key"], limit_pages=100)
         
-        body_proxy = await request.json()
-        body = body_proxy.to_py()
+        # 3. Executar Chunking
+        chunker = ChunkerRegulatorio(tamanho_max_chunk=1000)
+        chunks = chunker.criar_chunks(full_text)
         
-        chunks = body.get("chunks", [])
-        doc_metadata = body.get("metadata", {})
-
-        if not chunks:
-            return Response.new(
-                json.dumps({"error": "No chunks provided"}), 
-                JSON.parse(json.dumps({"status": 400, "headers": {"Content-Type": "application/json"}}))
-            )
-
-        print(f"DEBUG: Processando {len(chunks)} chunks para o doc {document_id}")
+        # 4. Vetorizar lote
+        processed = await process_and_vectorize_chunks(env, document_id, doc_result, chunks, start_chunk, limit_chunks)
         
-        # O process_and_vectorize_chunks já foi atualizado para lidar com listas
-        processed = await process_and_vectorize_chunks(env, document_id, doc_metadata, chunks)
+        total = len(chunks)
+        current = start_chunk + processed
+        finished = current >= total
+        
+        # Atualizar D1
+        status = 'processed' if finished else 'processing'
+        await env.agems_rag_db.prepare("UPDATE documents SET status = ?, chunk_count = ? WHERE id = ?").bind(status, current, document_id).run()
 
-        # Atualizar contagem no D1
-        await env.agems_rag_db.prepare("""
-            UPDATE documents 
-            SET chunk_count = chunk_count + ?, status = 'processed' 
-            WHERE id = ?
-        """).bind(processed, document_id).run()
+        return Response.new(json.dumps({
+            "success": True, "total_processed": current, "total_chunks": total, "is_finished": finished, "chunks_in_batch": processed
+        }), JSON.parse(json.dumps({"headers": {"Content-Type": "application/json"}})))
 
-        return Response.new(
-            json.dumps({"success": True, "processed_this_batch": processed}),
-            JSON.parse(json.dumps({"status": 200, "headers": {"Content-Type": "application/json"}}))
-        )
     except Exception as e:
-        print(f"ERRO NO ADD_CHUNKS: {str(e)}")
-        return Response.new(
-            json.dumps({"error": str(e)}), 
-            JSON.parse(json.dumps({"status": 500, "headers": {"Content-Type": "application/json"}}))
-        )
+        import traceback
+        return Response.new(json.dumps({"error": str(e), "trace": traceback.format_exc()}), to_js({"status": 500}))
+
+async def handle_add_chunks(request, env):
+    """Handler para ingestão externa (ingest.py)"""
+    try:
+        from js import JSON
+        from utils.vectorize import process_and_vectorize_chunks
+        body = (await request.json()).to_py()
+        document_id = request.url.split("/documents/")[1].split("/chunks")[0]
+        chunks_data = body.get("chunks", [])
+        
+        doc_db = (await env.agems_rag_db.prepare("SELECT * FROM documents WHERE id = ?").bind(document_id).first()).to_py()
+        meta = {**body.get("metadata", {}), **doc_db}
+        processed = await process_and_vectorize_chunks(env, document_id, meta, chunks_data)
+        
+        await env.agems_rag_db.prepare("UPDATE documents SET chunk_count = chunk_count + ? WHERE id = ?").bind(processed, document_id).run()
+        return Response.new(json.dumps({"success": True, "processed": processed}), to_js({"headers": {"Content-Type": "application/json"}}))
+    except Exception as e:
+        return Response.new(json.dumps({"error": str(e)}), to_js({"status": 500}))
+
+# ================================================================================
+# 5. MODO LOCAL E TESTES
+# ================================================================================
+
+def carregar_pdf_local(path: str) -> str:
+    with pdfplumber.open(path) as pdf:
+        return "\n".join([f"[[PAGINA:{i+1}]]\n{p.extract_text(layout=True) or ''}" for i, p in enumerate(pdf.pages)])
+
+def exportar_txt(chunks: List[Dict], path: str):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("RELATÓRIO DE CHUNKS CONSOLIDADO\n" + "="*80 + "\n")
+        for c in chunks:
+            f.write(f"\nCHUNK {c['chunk_id']} | PÁG: {c['pagina']} | TIPO: {c['tipo']}\n")
+            f.write(f"CONTEXTO: {c['contexto_hierarquico']}\n" + "-"*80 + f"\n{c['texto']}\n")
+
+if __name__ == "__main__":
+    # Teste local se executado diretamente
+    pdf_local = r"c:/Users/rlazaro/Documents/Projetos_AGEMS/agems-rag-api/documentos_para_processar/REN_1000_ANEEL.pdf"
+    if os.path.exists(pdf_local):
+        print("🚀 Processando localmente com PDFPLUMBER...")
+        text = carregar_pdf_local(pdf_local)
+        chunks = ChunkerRegulatorio().criar_chunks(text)
+        print(f"✅ {len(chunks)} chunks gerados.")
+        exportar_txt(chunks, pdf_local.replace(".pdf", "_consolidado.txt"))

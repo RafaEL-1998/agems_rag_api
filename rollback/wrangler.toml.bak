@@ -13,7 +13,7 @@ bucket_name = "agems-docs"
 [[d1_databases]]
 binding = "agems_rag_db"
 database_name = "agems-rag-db"
-database_id = "b71e3cd9-79fd-4c29-88d5-d4d573630bd8"
+database_id = "3545442e-116f-472a-8d02-18b9551c158b"
 
 [[vectorize]]
 binding = "VECTORIZE"

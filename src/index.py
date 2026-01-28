@@ -11,7 +11,7 @@ import json
 
 # Importar handlers
 from handlers.upload import handle_upload
-from handlers.chunks import handle_add_chunks
+from handlers.chunks import handle_add_chunks, handle_process
 from handlers.query import handle_query
 
 
@@ -30,6 +30,9 @@ async def on_fetch(request, env):
     
     elif "/documents/" in url and "/chunks" in url and method == "POST":
         return await handle_add_chunks(request, env)
+    
+    elif "/documents/" in url and "/process" in url and method == "POST":
+        return await handle_process(request, env)
     
     elif "/chat/query" in url and method == "POST":
         return await handle_query(request, env)
