@@ -1,0 +1,41 @@
+"""
+Módulo de Extração de Texto de PDF
+Responsável por processar PDFs e converter para texto com marcadores de página
+"""
+
+import pdfplumber
+
+
+def extract_text_from_pdf_local(pdf_path: str, verbose: bool = True) -> str:
+    """
+    Extrai texto de um PDF local com animação de progresso.
+    
+    Args:
+        pdf_path: Caminho do arquivo PDF
+        verbose: Se True, mostra progresso no terminal
+        
+    Returns:
+        str: Texto extraído com marcadores de página
+    """
+    with pdfplumber.open(pdf_path) as pdf:
+        total_paginas = len(pdf.pages)
+        text_parts = []
+        
+        for i, p in enumerate(pdf.pages):
+            if verbose:
+                pct = (i + 1) / total_paginas * 100
+                barra = '█' * int(pct / 5) + '░' * (20 - int(pct / 5))
+                print(
+                    f"\r📄 Extraindo texto: página {i+1}/{total_paginas} "
+                    f"[{pct:5.1f}%] {barra}",
+                    end="",
+                    flush=True
+                )
+            
+            texto = p.extract_text(layout=True) or ''
+            text_parts.append(f"[[PAGINA:{i+1}]]\n{texto}")
+        
+        if verbose:
+            print()  # Nova linha após a barra de progresso
+            
+        return "\n\n".join(text_parts)

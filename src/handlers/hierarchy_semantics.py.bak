@@ -1,0 +1,410 @@
+"""
+Módulo de Análise Hierárquica e Semântica para Documentos Regulatórios
+Otimizado para Resoluções ANEEL e textos legais brasileiros
+"""
+
+import re
+from typing import List, Dict, Optional
+from dataclasses import dataclass
+from enum import Enum
+
+
+# ================================================================================
+# ANÁLISE SEMÂNTICA
+# ================================================================================
+
+class AnalisadorRegulatorio:
+    """Classe para análise e extração de informações regulatórias semânticas"""
+    
+    @staticmethod
+    def extrair_referencias_cruzadas(texto: str) -> List[str]:
+        """Extrai referências cruzadas a outros artigos, parágrafos ou leis"""
+        referencias = []
+        padroes = [
+            r'art(?:igo)?\.?\s+(\d+(?:-[A-Z])?)[ºo°]?',
+            r'§\s*(\d+(?:-[A-Z])?)[ºo°]?',
+            r'inciso\s+([IVXLCDM]+(?:-[A-Z])?)',
+            r'Lei\s+n[ºo°]?\s*[\d.]+/\d{4}',
+            r'Decreto\s+n[ºo°]?\s*[\d.]+/\d{4}',
+            r'Resolução\s+(?:Normativa\s+)?n[ºo°]?\s*[\d.]+/\d{4}',
+        ]
+        for padrao in padroes:
+            matches = re.finditer(padrao, texto, re.IGNORECASE)
+            referencias.extend([m.group(0) for m in matches])
+        return list(set(referencias))
+    
+    @staticmethod
+    def extrair_valores_numericos(texto: str) -> Dict[str, List]:
+        """Extrai valores numéricos importantes (potências, prazos, multas, porcentagens)"""
+        valores = {
+            'potencias_mw': [],
+            'porcentagens': [],
+            'prazos_dias': [],
+            'valores_monetarios': []
+        }
+        
+        # Potências em MW/kW
+        potencias = re.finditer(r'(\d+(?:[.,]\d+)?)\s*(?:MW|kW)', texto, re.IGNORECASE)
+        valores['potencias_mw'] = [m.group(0) for m in potencias]
+        
+        # Porcentagens
+        porcentagens = re.finditer(r'(\d+(?:[.,]\d+)?)\s*%', texto)
+        valores['porcentagens'] = [m.group(0) for m in porcentagens]
+        
+        # Prazos em dias/meses
+        prazos = re.finditer(r'(\d+)\s*(?:dias|meses)', texto, re.IGNORECASE)
+        valores['prazos_dias'] = [m.group(0) for m in prazos]
+        
+        # Valores monetários
+        monetarios = re.finditer(r'R\$\s*[\d.,]+', texto)
+        valores['valores_monetarios'] = [m.group(0) for m in monetarios]
+        
+        return valores
+    
+    @staticmethod
+    def identificar_obrigacoes(texto: str) -> List[str]:
+        """Identifica verbos e locuções que indicam obrigatoriedade"""
+        obrigacoes = []
+        padroes = [
+            r'deverá\s+[^.;]+',
+            r'é\s+obrigat[oó]rio\s+[^.;]+',
+            r'deve\s+[^.;]+',
+            r'fica\s+obrigad[oa]\s+[^.;]+',
+        ]
+        for padrao in padroes:
+            matches = re.finditer(padrao, texto, re.IGNORECASE)
+            obrigacoes.extend([m.group(0) for m in matches])
+        return obrigacoes
+    
+    @staticmethod
+    def identificar_vedacoes(texto: str) -> List[str]:
+        """Identifica proibições e vedações"""
+        vedacoes = []
+        padroes = [
+            r'não\s+poder[áa]\s+[^.;]+',
+            r'é\s+vedado\s+[^.;]+',
+            r'fica\s+proibid[oa]\s+[^.;]+',
+            r'não\s+ser[áa]\s+permitido\s+[^.;]+',
+        ]
+        for padrao in padroes:
+            matches = re.finditer(padrao, texto, re.IGNORECASE)
+            vedacoes.extend([m.group(0) for m in matches])
+        return vedacoes
+
+
+class OtimizadorConsultas:
+    """Otimizador para expansão de termos de busca em regulação"""
+    
+    @staticmethod
+    def expandir_query(query: str) -> List[str]:
+        queries = [query]
+        sinonimos = {
+            'autorização': ['outorga', 'permissão', 'concessão'],
+            'empreendimento': ['projeto', 'instalação', 'usina'],
+            'potência': ['capacidade instalada', 'geração'],
+            'consumidor': ['usuário', 'titular'],
+            'faturamento': ['cobrança', 'conta de luz']
+        }
+        query_lower = query.lower()
+        for termo, s_list in sinonimos.items():
+            if termo in query_lower:
+                for s in s_list:
+                    queries.append(query_lower.replace(termo, s))
+        return queries
+
+
+# ================================================================================
+# ESTRUTURA HIERÁRQUICA
+# ================================================================================
+
+class TipoElemento(Enum):
+    """Tipos de elementos em documentos regulatórios"""
+    PREAMBULO = "preambulo"
+    RESOLUCAO = "resolucao"
+    TITULO = "titulo"
+    CAPITULO = "capitulo"
+    SECAO = "secao"
+    SUBSECAO = "subsecao"
+    ARTIGO = "artigo"
+    PARAGRAFO = "paragrafo"
+    INCISO = "inciso"
+    ALINEA = "alinea"
+    ITEM = "item"
+    ANEXO = "anexo"
+    CLAUSULA = "clausula"
+
+
+@dataclass
+class ElementoRegulatorio:
+    """Representa um elemento da estrutura hierárquica do documento"""
+    tipo: TipoElemento
+    numero: str
+    texto: str
+    nivel: int
+    pagina: int = 1
+    revogado: bool = False
+    pai: Optional['ElementoRegulatorio'] = None
+    contexto_hierarquico: str = ""
+
+
+# ================================================================================
+# PADRÕES DE TEXTO E LIMPEZA
+# ================================================================================
+
+class PadroesRegulatorios:
+    """Padrões regex para identificação de elementos regulatórios"""
+    
+    def __init__(self):
+        # Lista de trechos iniciais de parágrafos únicos revogados (primeiras 50 caracteres)
+        # Estes aparecem riscados no PDF mas o pdfplumber não detecta a formatação
+        self.paragrafos_unicos_revogados = [
+            "A distribuidora deve cadastrar de imediato a existê",
+            "Os ajustes de proteção devem ser apresentados à di",
+            "A distribuidora deve orientar e destacar no formulá",
+            "A distribuidora pode recusar o pedido se não forem",
+            "O aumento de carga para unidade consumidora atendid",
+            "A distribuidora deve custear as melhorias ou reforç",
+            "Não deve ser classificada na classe industrial a un",
+            "Alternativamente à emissão da segunda via, o consum",
+        ]
+        
+        self.padroes = {
+            'resolucao': re.compile(
+                r'^RESOLUÇ[ÃãA]O\s+NORMATIVA\s+ANEEL\s+Nº\s+([\d.]+)',
+                re.IGNORECASE | re.MULTILINE
+            ),
+            'titulo': re.compile(
+                r'^TÍTULO\s+([IVXLCDM\dºª]+)(?:\s*[-–—]?\s*(.*))?$',
+                re.IGNORECASE | re.MULTILINE
+            ),
+            'capitulo': re.compile(
+                r'^CAPÍTULO\s+([IVXLCDM\dºª]+)(?:\s*[-–—]?\s*(.*))?$',
+                re.IGNORECASE | re.MULTILINE
+            ),
+            'secao': re.compile(
+                r'^SEÇÃO\s+([IVXLCDM\dºª]+)(?:\s*[-–—]?\s*(.*))?$',
+                re.IGNORECASE | re.MULTILINE
+            ),
+            'subsecao': re.compile(
+                r'^SUBSEÇÃO\s+([IVXLCDM\dºª]+)(?:\s*[-–—]?\s*(.*))?$',
+                re.IGNORECASE | re.MULTILINE
+            ),
+            'artigo': re.compile(
+                r'^Art\.\s*(\d+[A-Z-]*)\.?\s*(.*)$',
+                re.IGNORECASE | re.MULTILINE
+            ),
+            'paragrafo': re.compile(
+                r'^[§õ]\s*(\d+)[-º]*\s*(.*)$',
+                re.MULTILINE
+            ),
+            'paragrafo_unico': re.compile(
+                r'^Parágrafo único\.\s*(.*)$',
+                re.IGNORECASE | re.MULTILINE
+            ),
+            'inciso': re.compile(
+                r'^([IVXLCDM]+(?:-[A-Z]+)?)\s*[–—\-]\s*(.*)$',
+                re.MULTILINE
+            ),
+            'alinea': re.compile(
+                r'^([a-z])\)\s*(.*)$',
+                re.MULTILINE
+            ),
+            'item': re.compile(
+                r'^\s*(\d+(?:\.\d+)*)\s*[\-–—.]\s*(.*)$',
+                re.MULTILINE
+            ),
+            'anexo': re.compile(
+                r'^ANEXO\s+([IVXLCDM]+|[0-9]+|[A-Z])\s*[-–—]?\s*(.*)$',
+                re.IGNORECASE | re.MULTILINE
+            ),
+            'clausula': re.compile(
+                r'^CLÁUSULA\s+([A-ZÁÉÍÓÚÀÈÌÒÙÃÕÂÊÎÔÛÇ0-9ºª]+(?:\s+[A-ZÁÉÍÓÚÀÈÌÒÙÃÕÂÊÎÔÛÇ0-9ºª]+){0,5})\s*[:–—]?\s*(.*)$',
+                re.IGNORECASE | re.MULTILINE
+            ),
+            'revogado': re.compile(
+                r'\((?:revogad[oa]|suprimid[oa]|exclu[íi]d[oa]|eliminad[oa])(?:[\s\S]*?)\)',
+                re.IGNORECASE
+            ),
+            'marcador_pagina': re.compile(
+                r'\[\[PAGINA:(\d+)\]\]',
+                re.MULTILINE
+            ),
+            'inicio_inclusao': re.compile(
+                r'^\(Inclu[ií]da\s+pela\s+REN\s+ANEEL.*de\s*$',
+                re.IGNORECASE
+            ),
+            'fim_inclusao': re.compile(
+                r'^\d{2}[./]\d{2}[./]\d{4}\)$'
+            ),
+            'trash': [
+                r'Este texto não substitui o (?:publicado|republicado) no Diário Oficial.*',
+                r'Publicado no DOU de \d{2}/\d{2}/\d{2}.*',
+                r'Diário Oficial da União\s?-\s?Seção\s?\d+.*',
+                r'Page \d+ of \d+.*',
+                r'^\s*\d+\s*$',
+                r'^\s*(\d{2}/\d{2}/\d{2},\s*\d{2}:\d{2}|Page\s+\d+\s+of\s+\d+)\s*$'
+            ]
+        }
+    
+    def is_paragrafo_unico_revogado(self, texto: str) -> bool:
+        """Verifica se o parágrafo único está na lista de revogados"""
+        texto_limpo = re.sub(
+            r'^Parágrafo único\.\s*',
+            '',
+            texto,
+            flags=re.IGNORECASE
+        )
+        inicio = texto_limpo[:50]
+        
+        for revogado in self.paragrafos_unicos_revogados:
+            if inicio.startswith(revogado[:40]):
+                return True
+        return False
+
+class LimpadorTexto:
+    """Responsável pela limpeza e normalização de texto"""
+    
+    def __init__(self):
+        self.padroes_lixo = [
+            r'(?i)ANDRÉ\s+PEPITONE\s+DA\s+NÓBREGA.*',
+            r'(?i)HÉLVIO\s+NEVES\s+GUERRA.*',
+            r'(?i)SANDRO\s+LAZZARI.*',
+            r'(?i)ÍNDICE.*',
+            r'(?i)Este texto não substitui o (?:publicado|republicado).*',
+            r'(?i)retificado no D\.O\. de .*',
+            r'(?i)\(\*\)\s*Republicado em razão de incorreções.*',
+            r'^\s*\d{2}/\d{2}/\d{2},\s*\d{2}:\d{2}\s*$',
+            r'\n?\s*Page\s+\d+\s+of\s+\d+\s*$',
+        ]
+        
+        self.correcoes_encoding = {
+            'TÃTULO': 'TÍTULO',
+            'CAPÃTULO': 'CAPÍTULO',
+            'Ã§Ã£o': 'ção',
+            'Ã§Ãµes': 'ções',
+            'Ã¡': 'á',
+            'Ã©': 'é',
+            'Ã­': 'í',
+            'Ã³': 'ó',
+            'Ãº': 'ú',
+            'Ã': 'à',
+            'Ãª': 'ê',
+            'Ã´': 'ô',
+            'Ã§': 'ç',
+            'à': 'ã',
+            '┴': 'Á',
+            '╔': 'É',
+            'Ý': 'í',
+            'þ': 'ã',
+            'ú': 'í',
+            'Ò': 'Õ',
+            'Ó': 'à',
+            'û': '–'
+        }
+    
+    def limpar(self, texto: str) -> str:
+        """Aplica todas as limpezas necessárias no texto"""
+        # Remove padrões de lixo
+        for padrao in self.padroes_lixo:
+            texto = re.sub(padrao, '', texto, flags=re.MULTILINE)
+        
+        # Correções de encoding
+        for errado, correto in self.correcoes_encoding.items():
+            texto = texto.replace(errado, correto)
+        
+        # Corrige õ que deveria ser §
+        texto = re.sub(r'õ(\s*\d)', r'§\1', texto)
+        
+        return texto.strip()
+    
+    def normalizar_estrutura(self, texto: str) -> str:
+        """Normaliza quebras de linha para melhor parsing"""
+        # Garante quebra de linha antes de elementos estruturais
+        quebras = [
+            r'([.;!?])\s*(TÍTULO\s+)',
+            r'([.;!?])\s*(CAPÍTULO\s+)',
+            r'([.;!?])\s*(SEÇÃO\s+)',
+            r'([.;!?])\s*(SUBSEÇÃO\s+)',
+            r'([.;!?])\s*(CLÁUSULA\s+)'
+        ]
+        for padrao in quebras:
+            texto = re.sub(padrao, r'\1\n\2', texto)
+        
+        # Anexos e cláusulas em nova linha
+        texto = re.sub(
+            r'([.;!?])\s*(ANEXO\s+[IVXLCDM0-9A-Z]+)',
+            r'\1\n\n\2',
+            texto
+        )
+        texto = re.sub(r'(?m)^ *(ANEXO\s+[IVXLCDM0-9A-Z]+)', r'\n\1', texto)
+        texto = re.sub(r'(?m)^ *(CLÁUSULA\s+)', r'\n\1', texto)
+        
+        # Artigos em nova linha
+        texto = re.sub(
+            r'([a-z0-9áàâãéêíóôõúç);:])\s+(Art\.?\s*\d+)',
+            r'\1\n\2',
+            texto
+        )
+        
+        return texto
+
+
+# ================================================================================
+# UTILITÁRIOS PARA HIERARQUIA
+# ================================================================================
+
+class UtilitariosHierarquia:
+    """Funções auxiliares para manipulação da hierarquia"""
+    
+    @staticmethod
+    def romano_para_valor(s: str) -> int:
+        """Converte numeral romano para inteiro"""
+        valores = {
+            'I': 1, 'V': 5, 'X': 10, 'L': 50,
+            'C': 100, 'D': 500, 'M': 1000
+        }
+        resultado = 0
+        s = s.upper()
+        for i in range(len(s)):
+            if i > 0 and valores[s[i]] > valores[s[i-1]]:
+                resultado += valores[s[i]] - 2 * valores[s[i-1]]
+            else:
+                resultado += valores[s[i]]
+        return resultado
+    
+    @staticmethod
+    def obter_nivel_por_tipo(tipo: TipoElemento) -> int:
+        """Retorna o nível hierárquico de um tipo de elemento"""
+        niveis = {
+            TipoElemento.RESOLUCAO: 0,
+            TipoElemento.TITULO: 1,
+            TipoElemento.ANEXO: 1,
+            TipoElemento.CAPITULO: 2,
+            TipoElemento.SECAO: 3,
+            TipoElemento.SUBSECAO: 4,
+            TipoElemento.ARTIGO: 5,
+            TipoElemento.CLAUSULA: 5,
+            TipoElemento.PARAGRAFO: 6,
+            TipoElemento.INCISO: 7,
+            TipoElemento.ALINEA: 8,
+            TipoElemento.ITEM: 9
+        }
+        return niveis.get(tipo, 10)
+    
+    @staticmethod
+    def obter_nome_exibicao(tipo: TipoElemento) -> str:
+        """Retorna o nome de exibição de um tipo de elemento"""
+        nomes = {
+            TipoElemento.TITULO: "Título",
+            TipoElemento.CAPITULO: "Capítulo",
+            TipoElemento.SECAO: "Seção",
+            TipoElemento.SUBSECAO: "Subseção",
+            TipoElemento.ARTIGO: "Artigo",
+            TipoElemento.PARAGRAFO: "Parágrafo",
+            TipoElemento.INCISO: "Inciso",
+            TipoElemento.ALINEA: "Alínea",
+            TipoElemento.ITEM: "Item",
+            TipoElemento.ANEXO: "Anexo",
+            TipoElemento.CLAUSULA: "Cláusula"
+        }
+        return nomes.get(tipo, tipo.value)
